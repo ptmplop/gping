@@ -11,7 +11,8 @@ use std::time::Duration;
 ///
 /// Each target gets its own baseline latency, derived from its name so a given target
 /// always looks the same. The latency drifts slowly around that baseline, spikes now and
-/// then, and an occasional ping is lost (`PINGER_FAKE_LOSS`, a ratio, defaults to 0.01).
+/// then, and an occasional ping is lost (`PINGER_FAKE_LOSS`, a ratio, defaults to 0.01);
+/// some losses start a short outage.
 pub struct FakePinger {
     options: PingOptions,
 }
@@ -49,6 +50,7 @@ impl Pinger for FakePinger {
             let baseline = 6.0 + (seed % 48) as f64;
             let mut level = baseline;
             let mut spike = 0.0f64;
+            let mut outage = 0u32;
             loop {
                 level += (random.random::<f64>() - 0.5) * baseline * 0.06;
                 level = level.clamp(baseline * 0.85, baseline * 1.5);
@@ -58,7 +60,15 @@ impl Pinger for FakePinger {
                 spike *= 0.6;
                 let ms = level + spike + random.random::<f64>() * baseline * 0.08;
 
-                let result = if random.random::<f64>() < loss {
+                if outage == 0 && random.random::<f64>() < loss {
+                    outage = if random.random::<f64>() < 0.25 {
+                        random.random_range(5..12)
+                    } else {
+                        1
+                    };
+                }
+                let result = if outage > 0 {
+                    outage -= 1;
                     PingResult::Timeout("Fake ping timeout".to_string())
                 } else {
                     PingResult::Pong(
@@ -96,7 +106,8 @@ mod tests {
             .collect();
         assert!(replies.len() > 250, "{} replies", replies.len());
         assert!(replies.iter().all(|ms| (1.0..1_000.0).contains(ms)));
-        let spread = replies.iter().copied().fold(0.0, f64::max) - replies.iter().copied().fold(f64::MAX, f64::min);
+        let spread = replies.iter().copied().fold(0.0, f64::max)
+            - replies.iter().copied().fold(f64::MAX, f64::min);
         assert!(spread > 1.0, "the latency should move around");
     }
 }

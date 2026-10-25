@@ -145,10 +145,14 @@ fn parse_interval(value: &str) -> Result<f64, String> {
         .parse()
         .map_err(|_| format!("'{value}' is not a number of seconds"))?;
     if !seconds.is_finite() || seconds <= 0.0 {
-        return Err(format!("the interval must be more than 0 seconds, not '{value}'"));
+        return Err(format!(
+            "the interval must be more than 0 seconds, not '{value}'"
+        ));
     }
     if seconds > 3_600.0 {
-        return Err(format!("the interval can be at most an hour, not '{value}'"));
+        return Err(format!(
+            "the interval can be at most an hour, not '{value}'"
+        ));
     }
     Ok(seconds)
 }
@@ -176,7 +180,12 @@ mod tests {
     fn buffer_must_be_positive_and_bounded() {
         assert!(Args::try_parse_from(["gping", "-b", "0", "host"]).is_err());
         assert!(Args::try_parse_from(["gping", "-b", "10000000000000", "host"]).is_err());
-        assert_eq!(Args::try_parse_from(["gping", "-b", "60", "host"]).unwrap().buffer, 60);
+        assert_eq!(
+            Args::try_parse_from(["gping", "-b", "60", "host"])
+                .unwrap()
+                .buffer,
+            60
+        );
     }
 
     // The flag used to have `help = ""`, which blanked its description in --help and the

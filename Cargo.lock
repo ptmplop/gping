@@ -498,6 +498,7 @@ dependencies = [
  "pinger",
  "ratatui",
  "signal-hook",
+ "unicode-width",
 ]
 
 [[package]]

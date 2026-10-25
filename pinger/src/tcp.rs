@@ -139,8 +139,14 @@ mod tests {
 
     #[test]
     fn the_timeout_is_not_the_interval() {
-        assert_eq!(connect_timeout(Duration::from_millis(200)), Duration::from_secs(2));
-        assert_eq!(connect_timeout(Duration::from_secs(5)), Duration::from_secs(5));
+        assert_eq!(
+            connect_timeout(Duration::from_millis(200)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            connect_timeout(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
     }
 
     #[test]
@@ -156,7 +162,10 @@ mod tests {
     #[test]
     fn a_refused_connection_follows_the_rst_setting() {
         // Bind and drop, to find a port nothing is listening on.
-        let addr = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
         assert!(matches!(
             probe(addr, Duration::from_millis(300), RstBehaviour::Pong),
             PingResult::Pong(..)
@@ -166,18 +175,20 @@ mod tests {
             probe(addr, Duration::from_millis(300), RstBehaviour::Drop),
             PingResult::Timeout(_)
         ));
-        assert!(started.elapsed() >= Duration::from_millis(300), "reported after the timeout");
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "reported after the timeout"
+        );
     }
 
     // IPv6 literals used to be formatted as "::1:80", which is not an address at all.
     #[test]
     fn ipv6_literals_resolve() {
-        let options = PingOptions::new("::1", Duration::from_secs(1), None).with_mode(
-            PingMode::TCP {
+        let options =
+            PingOptions::new("::1", Duration::from_secs(1), None).with_mode(PingMode::TCP {
                 rst: RstBehaviour::Pong,
                 port: Some(443),
-            },
-        );
+            });
         let pinger = TcpPinger::from_options(options).unwrap();
         assert!(pinger.resolve().unwrap().is_ipv6());
     }

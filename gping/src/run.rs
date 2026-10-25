@@ -57,6 +57,8 @@ pub fn run(args: Args) -> Result<Outcome> {
         .map(|s| region_map::try_host_from_cloud_region(s).unwrap_or_else(|| s.clone()))
         .collect();
     let colors = theme::series_colors(&args.color_codes_or_names, names.len())?;
+    let chosen = args.color_codes_or_names.len();
+    let depth = ColorDepth::detect();
 
     // Work everything out before touching the terminal, so that any error is reported on a
     // normal screen.
@@ -67,15 +69,24 @@ pub fn run(args: Args) -> Result<Outcome> {
     }));
     let mut hosts = Vec::with_capacity(names.len());
     let mut probes = Vec::with_capacity(names.len());
-    for (name, (color, tint)) in names.into_iter().zip(colors) {
-        if args.cmd {
+    for (index, (name, (color, tint))) in names.into_iter().zip(colors).enumerate() {
+        // Palette colours have a named stand-in on 16-colour terminals; chosen ones are kept.
+        let color = match depth {
+            ColorDepth::Ansi16 if index >= chosen => {
+                theme::SERIES_16[(index - chosen) % theme::SERIES_16.len()]
+            }
+            _ => color,
+        };
+        let mut host = if args.cmd {
             probes.push(Probe::Command(probes::parse_command(&name)?));
-            hosts.push(Host::new(name, None, color, tint));
+            Host::new(name, None, color, tint)
         } else {
             let target = hosts::resolve(&name, args.ipv4, args.ipv6)?;
             probes.push(Probe::Ping(ping_options(&args, &target, interval)));
-            hosts.push(Host::new(name, target.address.map(|a| a.to_string()), color, tint));
-        }
+            Host::new(name, target.address.map(|a| a.to_string()), color, tint)
+        };
+        host.chosen_color = index < chosen;
+        hosts.push(host);
     }
 
     let (tx, rx) = mpsc::channel();
@@ -90,8 +101,7 @@ pub fn run(args: Args) -> Result<Outcome> {
     }
 
     let mut app = App::new(hosts, args.buffer as f64, 0.0, yrange);
-    let mut ui = Ui::new(UiOptions::from_args(&args, interval));
-    let depth = ColorDepth::detect();
+    let mut ui = Ui::new(UiOptions::from_args(&args, interval, depth));
 
     let guard = TerminalGuard::enter(args.clear)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(BufWriter::with_capacity(
@@ -117,7 +127,9 @@ pub fn run(args: Args) -> Result<Outcome> {
             dirty = false;
         }
 
-        let wait = frame_interval.saturating_sub(last_frame.elapsed()).max(Duration::from_millis(5));
+        let wait = frame_interval
+            .saturating_sub(last_frame.elapsed())
+            .max(Duration::from_millis(5));
         let event = match rx.recv_timeout(wait) {
             Ok(event) => event,
             Err(RecvTimeoutError::Timeout) => continue,
@@ -141,7 +153,8 @@ pub fn run(args: Args) -> Result<Outcome> {
             }
             Event::Input(TerminalEvent::Key(key)) if key.kind != KeyEventKind::Release => {
                 let quit = matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-                    || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+                    || (key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL));
                 if quit {
                     break Outcome::Done;
                 }

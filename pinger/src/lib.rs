@@ -359,7 +359,7 @@ pub fn get_pinger(
 
     #[cfg(windows)]
     {
-        return Ok(Arc::new(windows::WindowsPinger::from_options(options)?));
+        Ok(Arc::new(windows::WindowsPinger::from_options(options)?))
     }
     #[cfg(unix)]
     {

@@ -5,9 +5,6 @@
 //! constant width no matter how the values move: `0.42 ms`, `3.21 ms`, `42.1 ms`, `421 ms`,
 //! `1.42 s`.
 
-/// The widest string [`latency`] produces, e.g. `42.1 ms`.
-pub const LATENCY_WIDTH: usize = 7;
-
 /// Formats a latency given in microseconds.
 pub fn latency(us: f64) -> String {
     if !us.is_finite() || us < 0.0 {
@@ -31,6 +28,16 @@ pub fn latency(us: f64) -> String {
         } else {
             format!("{s:.0} s")
         }
+    }
+}
+
+/// [`latency`] without the unit when it's milliseconds, for tight columns that say "ms"
+/// elsewhere: `7.65`, `105`, but `1.42s`.
+pub fn short(us: f64) -> String {
+    let text = latency(us);
+    match text.strip_suffix(" ms") {
+        Some(ms) => ms.to_string(),
+        None => text.replace(' ', ""),
     }
 }
 
@@ -113,6 +120,15 @@ pub fn axis_tick(us: f64, step_us: f64, max_us: f64) -> String {
     format!("{value:.decimals$} {unit}")
 }
 
+/// A tick label without its unit, which the axis states once: `20`, `2.5`, `1.5s`.
+pub fn tick(us: f64, step_us: f64, max_us: f64) -> String {
+    let label = axis_tick(us, step_us, max_us);
+    match label.strip_suffix(" ms") {
+        Some(ms) => ms.to_string(),
+        None => label.replace(' ', ""),
+    }
+}
+
 /// Formats an elapsed number of seconds as `42s`, `3m 07s` or `2h 05m`.
 pub fn elapsed(secs: u64) -> String {
     let (h, m, s) = (secs / 3_600, (secs / 60) % 60, secs % 60);
@@ -122,6 +138,17 @@ pub fn elapsed(secs: u64) -> String {
         format!("{m}m {s:02}s")
     } else {
         format!("{s}s")
+    }
+}
+
+/// A length of time as `1.2 s`, `14 s` or `2m 05s`.
+pub fn duration(secs: f64) -> String {
+    if secs < 9.95 {
+        format!("{secs:.1} s")
+    } else if secs < 59.5 {
+        format!("{secs:.0} s")
+    } else {
+        elapsed(secs.round() as u64)
     }
 }
 
@@ -139,6 +166,9 @@ pub fn percent(ratio: f64) -> String {
 mod tests {
     use super::*;
 
+    /// The widest string [`latency`] produces, e.g. `42.1 ms`.
+    const LATENCY_WIDTH: usize = 7;
+
     #[test]
     fn latency_uses_three_significant_digits() {
         assert_eq!(latency(420.0), "0.42 ms");
@@ -152,7 +182,11 @@ mod tests {
     #[test]
     fn latency_never_rounds_into_a_wider_form() {
         for us in [9_996.0, 99_960.0, 999_600.0, 9_996_000.0] {
-            assert!(latency(us).len() <= LATENCY_WIDTH, "{us} -> {}", latency(us));
+            assert!(
+                latency(us).len() <= LATENCY_WIDTH,
+                "{us} -> {}",
+                latency(us)
+            );
         }
         assert_eq!(latency(9_996.0), "10.0 ms");
         assert_eq!(latency(999_600.0), "1.00 s");
@@ -167,7 +201,11 @@ mod tests {
     fn latency_width_is_bounded() {
         let mut us = 1.0;
         while us < 1e9 {
-            assert!(latency(us).len() <= LATENCY_WIDTH, "{us} -> {}", latency(us));
+            assert!(
+                latency(us).len() <= LATENCY_WIDTH,
+                "{us} -> {}",
+                latency(us)
+            );
             us *= 1.07;
         }
     }
@@ -191,10 +229,32 @@ mod tests {
     }
 
     #[test]
+    fn durations() {
+        assert_eq!(duration(1.2), "1.2 s");
+        assert_eq!(duration(14.0), "14 s");
+        assert_eq!(duration(125.0), "2m 05s");
+    }
+
+    #[test]
+    fn tick_labels() {
+        assert_eq!(tick(5_000.0, 1_000.0, 5_000.0), "5");
+        assert_eq!(tick(2_500.0, 500.0, 5_000.0), "2.5");
+        assert_eq!(tick(1_500_000.0, 500_000.0, 2_000_000.0), "1.5s");
+    }
+
+    #[test]
     fn elapsed_times() {
         assert_eq!(elapsed(7), "7s");
         assert_eq!(elapsed(187), "3m 07s");
         assert_eq!(elapsed(7_500), "2h 05m");
+    }
+
+    #[test]
+    fn short_forms() {
+        assert_eq!(short(7_654.0), "7.65");
+        assert_eq!(short(105_000.0), "105");
+        assert_eq!(short(1_420_000.0), "1.42s");
+        assert_eq!(short(f64::NAN), "-");
     }
 
     #[test]

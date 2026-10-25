@@ -33,40 +33,23 @@ impl Marker {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scale {
-    Linear,
-    /// Logarithmic: equal ratios take equal space, so 8 to 16 ms looks as big as 50 to 100.
-    Log,
-}
-
-impl Scale {
-    /// Maps a latency onto the axis. Values the log scale can't place sit at its floor.
-    pub fn map(self, value: f64) -> f64 {
-        match self {
-            Scale::Linear => value,
-            Scale::Log => value.max(1.0).ln(),
-        }
-    }
-
-    /// The inverse of [`Scale::map`].
-    pub fn unmap(self, position: f64) -> f64 {
-        match self {
-            Scale::Linear => position,
-            Scale::Log => position.exp(),
-        }
-    }
-}
-
-/// A background tint from a series' line down to the floor of the plot.
+/// A background tint under a series' line, down to the floor of the plot. It starts at the
+/// line's typical level (a rolling median) rather than at the line itself, so a spike stays
+/// a crisp stroke instead of growing a tinted tower underneath.
 #[derive(Debug, Clone, Copy)]
 pub struct Glow {
     pub tint: Rgb,
-    /// How much of the tint is blended in right under the line...
+    /// How much of the tint is blended in at the top of the fill...
     pub top: f64,
     /// ...and at the floor.
     pub bottom: f64,
 }
+
+/// Cells either side whose line height the fill's top follows.
+const FILL_MEDIAN_REACH: usize = 3;
+/// Distinct tint strengths. Fewer means longer runs of identical cells, which keeps frames
+/// small; six is already indistinguishable from a smooth gradient.
+const FILL_LEVELS: f64 = 6.0;
 
 pub struct Series<'a> {
     /// `(timestamp in seconds, latency in microseconds or NaN)`, in chronological order.
@@ -85,9 +68,7 @@ pub struct Series<'a> {
 pub struct Plot<'a> {
     pub series: Vec<Series<'a>>,
     pub x_bounds: [f64; 2],
-    /// In latency units; the scale is applied when mapping.
     pub y_bounds: [f64; 2],
-    pub scale: Scale,
     pub marker: Marker,
     /// Values at which to draw a faint guide.
     pub grid: Vec<f64>,
@@ -95,7 +76,7 @@ pub struct Plot<'a> {
     /// The background the tints are blended against.
     pub base: Rgb,
     /// Background for the columns that hold a lost ping.
-    pub curtain: Option<Rgb>,
+    pub curtain: Option<Color>,
 }
 
 /// What the plot drew where, for the widgets that annotate it.
@@ -126,9 +107,7 @@ struct Raster {
     height: usize,
     res: (usize, usize),
     x_bounds: [f64; 2],
-    /// Already mapped through the scale.
     y_bounds: [f64; 2],
-    scale: Scale,
 }
 
 impl Raster {
@@ -149,7 +128,7 @@ impl Raster {
     fn y(&self, value: f64) -> i64 {
         let [y0, y1] = self.y_bounds;
         let h = self.height as f64 - 1.0;
-        let row = ((y1 - self.scale.map(value)) / (y1 - y0) * h).round();
+        let row = ((y1 - value) / (y1 - y0) * h).round();
         row.clamp(-2.0 * h - 2.0, 3.0 * h + 2.0) as i64
     }
 
@@ -157,7 +136,7 @@ impl Raster {
     fn value_at(&self, row: f64) -> f64 {
         let [y0, y1] = self.y_bounds;
         let h = (self.height as f64 - 1.0).max(1.0);
-        self.scale.unmap(y1 - row / h * (y1 - y0))
+        y1 - row / h * (y1 - y0)
     }
 
     fn layer(&self, samples: &[(f64, f64)]) -> Layer {
@@ -220,7 +199,12 @@ impl Raster {
     /// The cell holding the dot `(x, y)`, if it is inside the plot.
     fn cell(&self, (x, y): (i64, i64)) -> Option<(u16, u16)> {
         let inside = x >= 0 && y >= 0 && (x as usize) < self.width && (y as usize) < self.height;
-        inside.then(|| ((x as usize / self.res.0) as u16, (y as usize / self.res.1) as u16))
+        inside.then(|| {
+            (
+                (x as usize / self.res.0) as u16,
+                (y as usize / self.res.1) as u16,
+            )
+        })
     }
 }
 
@@ -259,7 +243,7 @@ impl Plot<'_> {
     pub fn render(&self, area: Rect, buf: &mut Buffer) -> Drawn {
         let area = area.intersection(buf.area);
         let [x0, x1] = self.x_bounds;
-        let (y0, y1) = (self.scale.map(self.y_bounds[0]), self.scale.map(self.y_bounds[1]));
+        let [y0, y1] = self.y_bounds;
         // Written this way round so NaN bounds count as invalid too.
         let valid = area.width > 0 && area.height > 0 && x1 > x0 && y1 > y0;
         if !valid {
@@ -272,7 +256,6 @@ impl Plot<'_> {
             res: (rx, ry),
             x_bounds: self.x_bounds,
             y_bounds: [y0, y1],
-            scale: self.scale,
         };
         let (w, h) = (area.width as usize, area.height as usize);
         let at = |cx: usize, cy: usize| (area.x + cx as u16, area.y + cy as u16);
@@ -293,22 +276,54 @@ impl Plot<'_> {
             }
         }
 
-        let layers: Vec<Layer> = self.series.iter().map(|s| raster.layer(s.samples)).collect();
+        let layers: Vec<Layer> = self
+            .series
+            .iter()
+            .map(|s| raster.layer(s.samples))
+            .collect();
 
         // Glows: per cell, the strongest of the series' tints wins, so hues never mix.
         let mut glow: Vec<Option<(f64, Rgb)>> = vec![None; w * h];
         for (series, layer) in self.series.iter().zip(&layers) {
             let Some(g) = series.glow else { continue };
+            // The replies in each cell column, to find the line's typical level by.
+            let mut values: Vec<Vec<f64>> = vec![Vec::new(); w];
+            for &(t, v) in series.samples {
+                let x = raster.x(t);
+                if !v.is_nan() && x >= 0 && (x as usize) < raster.width {
+                    values[x as usize / rx].push(v);
+                }
+            }
             for cx in 0..w {
-                let top = (0..rx).filter_map(|dx| layer.tops[cx * rx + dx]).min();
-                let Some(top) = top else { continue };
-                let top_row = top / ry;
-                for cy in top_row..h {
-                    let depth = if h > 1 { (cy - top_row) as f64 / (h - 1) as f64 } else { 0.0 };
-                    let mut alpha = g.top + (g.bottom - g.top) * depth;
-                    if cy == top_row {
-                        // Only part of the line's own cell is under the line.
-                        alpha *= 1.0 - (top % ry) as f64 / ry as f64 * 0.5;
+                // The highest dot of the line in this column.
+                let Some(top) = (0..rx).filter_map(|dx| layer.tops[cx * rx + dx]).min() else {
+                    continue;
+                };
+                // The fill's top is the median reply around here (a spike doesn't move a
+                // median, however many columns it covers), but never above the line itself.
+                let reach =
+                    cx.saturating_sub(FILL_MEDIAN_REACH)..(cx + FILL_MEDIAN_REACH + 1).min(w);
+                let mut around: Vec<f64> = values[reach].iter().flatten().copied().collect();
+                let anchor = if around.is_empty() {
+                    top
+                } else {
+                    around.sort_by(f64::total_cmp);
+                    let typical = raster
+                        .y(around[around.len() / 2])
+                        .clamp(0, raster.height as i64 - 1);
+                    (typical as usize).max(top)
+                };
+                let (first_row, offset) = (anchor / ry, anchor % ry);
+                let depth = (h - first_row).max(1) as f64;
+                for cy in first_row..h {
+                    let mut alpha = g.top + (g.bottom - g.top) * (cy - first_row) as f64 / depth;
+                    if cy == first_row {
+                        // Only part of the first cell is under the fill's top.
+                        alpha *= 1.0 - offset as f64 / ry as f64;
+                    }
+                    let alpha = (alpha / g.top * FILL_LEVELS).round() / FILL_LEVELS * g.top;
+                    if alpha <= 0.0 {
+                        continue;
                     }
                     let cell = &mut glow[cy * w + cx];
                     if cell.is_none_or(|(a, _)| alpha > a) {
@@ -339,7 +354,7 @@ impl Plot<'_> {
             if let Some(curtain) = self.curtain {
                 for &cx in &columns {
                     for cy in 0..h {
-                        buf[at(cx as usize, cy)].set_bg(Color::from(curtain));
+                        buf[at(cx as usize, cy)].set_bg(curtain);
                     }
                 }
             }
@@ -354,11 +369,11 @@ impl Plot<'_> {
             for cy in 0..h {
                 for cx in 0..w {
                     let mut cell_bits = 0u8;
-                    for dx in 0..rx {
-                        for dy in 0..ry {
+                    for (dx, column) in BRAILLE_BITS.iter().enumerate().take(rx) {
+                        for (dy, bit) in column.iter().enumerate().take(ry) {
                             if raster.dot(layer, cx, cy, dx, dy) {
                                 cell_bits |= match self.marker {
-                                    Marker::Braille => BRAILLE_BITS[dx][dy],
+                                    Marker::Braille => *bit,
                                     Marker::Dot => 1,
                                 };
                             }
@@ -379,7 +394,9 @@ impl Plot<'_> {
             // The latency this row of cells stands for, for heat colouring.
             let value = raster.value_at((cy * ry) as f64 + (ry as f64 - 1.0) / 2.0);
             for cx in 0..w {
-                let Some(index) = owner[cy * w + cx] else { continue };
+                let Some(index) = owner[cy * w + cx] else {
+                    continue;
+                };
                 let series = &self.series[index];
                 let glyph = match self.marker {
                     Marker::Braille => braille(bits[cy * w + cx]),
@@ -388,7 +405,10 @@ impl Plot<'_> {
                 let is_head = heads[index] == Some((cx as u16, cy as u16));
                 let color = match (is_head, series.head) {
                     (true, Some(head)) => head,
-                    _ => series.heat.and_then(|heat| heat(value)).unwrap_or(series.color),
+                    _ => series
+                        .heat
+                        .and_then(|heat| heat(value))
+                        .unwrap_or(series.color),
                 };
                 buf[at(cx, cy)].set_char(glyph).set_fg(color);
             }
@@ -421,7 +441,6 @@ mod tests {
             }],
             x_bounds: [0.0, 10.0],
             y_bounds: [0.0, 100.0],
-            scale: Scale::Linear,
             marker: Marker::Braille,
             grid: vec![],
             grid_color: Color::Rgb(40, 40, 40),
@@ -437,7 +456,9 @@ mod tests {
     }
 
     fn row(buf: &Buffer, y: u16) -> String {
-        (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect()
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect()
     }
 
     fn is_blank(buf: &Buffer) -> bool {
@@ -457,9 +478,15 @@ mod tests {
 
     #[test]
     fn a_lost_ping_breaks_the_line_and_raises_a_curtain() {
-        let samples = [(0.5, 50.0), (1.0, 50.0), (2.0, f64::NAN), (9.0, 50.0), (10.0, 50.0)];
+        let samples = [
+            (0.5, 50.0),
+            (1.0, 50.0),
+            (2.0, f64::NAN),
+            (9.0, 50.0),
+            (10.0, 50.0),
+        ];
         let mut p = plot(&samples);
-        p.curtain = Some((90, 0, 0));
+        p.curtain = Some(Color::Rgb(90, 0, 0));
         let (buf, drawn) = render(&p, 20, 4);
         // Columns 5..15 (t = 2.5..7.5) must be empty: no line bridges the gap.
         for y in 0..buf.area.height {
@@ -485,8 +512,9 @@ mod tests {
     // exactly one slot moves every dot by exactly one column.
     #[test]
     fn scrolling_moves_everything_by_whole_dots() {
-        let samples: Vec<(f64, f64)> =
-            (0..400).map(|i| (i as f64 * 0.05, ((i * 37) % 90) as f64)).collect();
+        let samples: Vec<(f64, f64)> = (0..400)
+            .map(|i| (i as f64 * 0.05, ((i * 37) % 90) as f64))
+            .collect();
         // A frame as it would be drawn at `now`: with the samples taken so far.
         let frame = |now: f64| {
             let taken = samples.partition_point(|(t, _)| *t <= now);
@@ -495,7 +523,9 @@ mod tests {
             render(&p, 20, 4).0
         };
         let cells = |buf: &Buffer, y: u16| -> Vec<String> {
-            (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect()
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect()
         };
         let a = frame(15.0);
         // Less than a slot (0.25 s) later only the newest cell, being written, can differ.
@@ -520,7 +550,10 @@ mod tests {
             bottom: 0.1,
         });
         let (buf, _) = render(&p, 10, 4);
-        assert!((0..10).all(|x| buf[(x, 0)].bg == Color::Reset), "nothing above the line");
+        assert!(
+            (0..10).all(|x| buf[(x, 0)].bg == Color::Reset),
+            "nothing above the line"
+        );
         let bottom = buf[(5, 3)].bg;
         let below_line = buf[(5, 2)].bg;
         assert_ne!(bottom, Color::Reset);
@@ -530,6 +563,24 @@ mod tests {
         } else {
             panic!("{:?} {:?}", below_line, bottom);
         }
+    }
+
+    // The fill follows the line's typical level, so a short spike doesn't grow a tinted
+    // tower under it.
+    #[test]
+    fn spikes_get_no_fill_tower() {
+        let mut samples: Vec<(f64, f64)> = (0..=40).map(|i| (i as f64 * 0.25, 20.0)).collect();
+        samples[20].1 = 95.0;
+        let mut p = plot(&samples);
+        p.series[0].glow = Some(Glow {
+            tint: (0, 0, 200),
+            top: 0.5,
+            bottom: 0.1,
+        });
+        let (buf, _) = render(&p, 20, 8);
+        // Under the spike, the rows above the usual level stay untinted.
+        assert!((0..5).all(|y| buf[(10, y)].bg == Color::Reset));
+        assert_ne!(buf[(10, 7)].bg, Color::Reset);
     }
 
     #[test]
@@ -556,20 +607,6 @@ mod tests {
     }
 
     #[test]
-    fn log_scale_spreads_small_values() {
-        // On a linear 0-100 scale 2 and 4 share the bottom row; on a log 1-100 scale they don't.
-        let samples = [(0.0, 2.0), (4.9, 2.0), (5.1, 4.0), (10.0, 4.0)];
-        let mut p = plot(&samples);
-        p.y_bounds = [1.0, 100.0];
-        let (linear, _) = render(&p, 20, 8);
-        p.scale = Scale::Log;
-        let (log, _) = render(&p, 20, 8);
-        let rows = |buf: &Buffer| (0..8).filter(|&y| row(buf, y).trim() != "").count();
-        assert_eq!(rows(&linear), 1);
-        assert!(rows(&log) >= 2);
-    }
-
-    #[test]
     fn tiny_or_degenerate_areas_do_not_panic() {
         let samples = [(0.0, 50.0), (5.0, f64::NAN), (10.0, 5000.0)];
         for (w, h) in [(0, 0), (1, 1), (0, 5), (5, 0), (2, 1)] {
@@ -588,7 +625,10 @@ mod tests {
         // 5000 is 50x the axis maximum: the line climbs out of the top and stays out.
         let samples = [(0.0, 50.0), (5.0, 5000.0), (10.0, 50.0)];
         let (buf, _) = render(&plot(&samples), 10, 4);
-        assert!(row(&buf, 0).trim() != "", "the line should reach the top edge");
+        assert!(
+            row(&buf, 0).trim() != "",
+            "the line should reach the top edge"
+        );
     }
 
     #[test]
@@ -616,7 +656,16 @@ mod tests {
             head: None,
         });
         let (buf, _) = render(&p, 10, 4);
-        let colors: Vec<Color> = buf.content.iter().filter(|c| c.symbol() != " ").map(|c| c.fg).collect();
-        assert!(colors.iter().all(|&c| c == Color::Rgb(255, 0, 0)), "{:?}", colors);
+        let colors: Vec<Color> = buf
+            .content
+            .iter()
+            .filter(|c| c.symbol() != " ")
+            .map(|c| c.fg)
+            .collect();
+        assert!(
+            colors.iter().all(|&c| c == Color::Rgb(255, 0, 0)),
+            "{:?}",
+            colors
+        );
     }
 }

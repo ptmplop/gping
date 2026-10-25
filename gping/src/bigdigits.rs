@@ -43,8 +43,6 @@ const LIGHT: [[&str; 3]; 11] = [
     ["   ", "╶─╴", "   "],
 ];
 
-pub const HEIGHT: u16 = 3;
-
 /// Cells needed to draw `text` (digits, '-', and '.').
 pub fn width(text: &str) -> u16 {
     let glyphs = text.chars().filter(|c| *c != '.').count() as u16;
@@ -88,7 +86,12 @@ pub fn render(text: &str, x: u16, y: u16, style: Style, light: bool, buf: &mut B
             for (col, symbol) in line.chars().enumerate() {
                 if symbol != ' ' {
                     let mut utf8 = [0u8; 4];
-                    put(cx + col as u32, y + row as u32, symbol.encode_utf8(&mut utf8), buf);
+                    put(
+                        cx + col as u32,
+                        y + row as u32,
+                        symbol.encode_utf8(&mut utf8),
+                        buf,
+                    );
                 }
             }
         }
@@ -102,10 +105,14 @@ mod tests {
     use tui::layout::Rect;
 
     fn draw(text: &str) -> Vec<String> {
-        let mut buf = Buffer::empty(Rect::new(0, 0, width(text), HEIGHT));
+        let mut buf = Buffer::empty(Rect::new(0, 0, width(text), 3));
         render(text, 0, 0, Style::default(), false, &mut buf);
-        (0..HEIGHT)
-            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect())
+        (0..3)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect()
+            })
             .collect()
     }
 

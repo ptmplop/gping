@@ -35,7 +35,7 @@ impl Pinger for WindowsPinger {
     fn start(&self) -> Result<mpsc::Receiver<PingResult>, PingCreationError> {
         let interval = self.options.interval;
         let parsed_ip = match &self.options.target {
-            Target::IP(ip) => ip.clone(),
+            Target::IP(ip) => *ip,
             Target::Hostname { domain, version } => {
                 let ips = (domain.as_str(), 0).to_socket_addrs()?;
                 let selected_ips: Vec<_> = if *version == IPVersion::Any {
@@ -67,7 +67,7 @@ impl Pinger for WindowsPinger {
             let pinger = WinPinger::new().expect("Failed to create a WinPinger instance");
             let mut buffer = Buffer::new();
             loop {
-                match pinger.send(parsed_ip.clone(), &mut buffer) {
+                match pinger.send(parsed_ip, &mut buffer) {
                     Ok(rtt) => {
                         if tx
                             .send(PingResult::Pong(

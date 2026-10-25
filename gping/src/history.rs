@@ -16,10 +16,6 @@ pub struct Bucket {
 }
 
 impl Bucket {
-    pub fn mean(&self) -> Option<f64> {
-        (self.replies > 0).then(|| self.sum / f64::from(self.replies))
-    }
-
     pub fn is_empty(&self) -> bool {
         self.replies == 0 && self.lost == 0
     }
@@ -85,22 +81,17 @@ impl History {
         self.width *= 2.0;
     }
 
-    /// The session squeezed (or stretched) into `columns` buckets, oldest first. Each column
-    /// combines the buckets that fall into its share of the session.
+    /// The session in at most `columns` buckets, oldest first: squeezed when it has more,
+    /// each column combining the buckets in its share of the session. A short session isn't
+    /// stretched to fill the space; it grows into it.
     pub fn columns(&self, columns: usize) -> Vec<Bucket> {
-        let mut out = vec![Bucket::default(); columns];
-        if columns == 0 || self.buckets.is_empty() {
-            return out;
-        }
         let n = self.buckets.len();
-        for (i, bucket) in self.buckets.iter().enumerate() {
-            let column = (i * columns / n).min(columns - 1);
-            out[column].add(bucket);
+        if n <= columns {
+            return self.buckets.clone();
         }
-        // With fewer buckets than columns some columns get nothing; spread the buckets out
-        // instead of leaving gaps between them.
-        if n < columns {
-            out = (0..columns).map(|c| self.buckets[c * n / columns]).collect();
+        let mut out = vec![Bucket::default(); columns];
+        for (i, bucket) in self.buckets.iter().enumerate() {
+            out[(i * columns / n).min(columns - 1)].add(bucket);
         }
         out
     }
@@ -121,10 +112,10 @@ mod tests {
         h.record(100.7, 30.0);
         h.record(101.1, f64::NAN);
         assert_eq!(h.buckets.len(), 2);
-        assert_eq!(h.buckets[0].mean(), Some(20.0));
+        assert_eq!(h.buckets[0].sum / f64::from(h.buckets[0].replies), 20.0);
         assert_eq!(h.buckets[0].max, 30.0);
         assert_eq!(h.buckets[1].lost, 1);
-        assert_eq!(h.buckets[1].mean(), None);
+        assert_eq!(h.buckets[1].replies, 0);
     }
 
     #[test]
@@ -151,12 +142,11 @@ mod tests {
     }
 
     #[test]
-    fn a_short_session_is_stretched_not_gappy() {
+    fn a_short_session_is_not_stretched() {
         let mut h = History::new(0.0);
         h.record(0.0, 5.0);
         h.record(1.0, 7.0);
-        let columns = h.columns(6);
-        assert!(columns.iter().all(|c| !c.is_empty()));
+        assert_eq!(h.columns(6).len(), 2);
     }
 
     #[test]
@@ -164,7 +154,7 @@ mod tests {
         let h = History::new(0.0);
         assert!(h.is_empty());
         assert_eq!(h.columns(0).len(), 0);
-        assert!(h.columns(4).iter().all(Bucket::is_empty));
+        assert!(h.columns(4).is_empty());
         let mut h = History::new(10.0);
         // A clock that steps backwards lands in the first bucket instead of panicking.
         h.record(5.0, 1.0);
