@@ -300,8 +300,12 @@ pub fn footer(buf: &mut Buffer, rect: Rect, scene: &Scene, views: &[HostView]) {
         ("✕", bold(t.loss)),
         (" lost ", fg(t.muted)),
     ];
-    // Heat only once a host has a baseline to be slower than, and never without colour.
-    let has_heat = t.shows_heat && views.iter().any(|v| v.baseline.is_some());
+    // Heat only once a host has a baseline to be slower than, never without colour, and not
+    // for hosts whose colour was chosen with --color (that wins over heat).
+    let has_heat = t.shows_heat
+        && views
+            .iter()
+            .any(|v| v.baseline.is_some() && !scene.app.hosts[v.index].chosen_color);
     let limit = if rect.width >= 90 && has_heat {
         spans_right(buf, right, y, &legend, rect.x + 40).unwrap_or(right)
     } else if rect.width >= 60 && has_heat {

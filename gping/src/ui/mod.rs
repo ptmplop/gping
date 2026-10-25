@@ -644,6 +644,11 @@ mod tests {
         );
         assert!(screen(ColorDepth::TrueColor, &mut app, 80, 24, false).contains("━━━ slow"));
         assert!(!screen(ColorDepth::Mono, &mut app, 120, 34, false).contains("slower"));
+        // A colour chosen with --color isn't heated, so there's nothing to explain.
+        let mut chosen =
+            crate::app::App::new(app.hosts.drain(..1).collect(), 30.0, 0.0, (None, None));
+        chosen.hosts[0].chosen_color = true;
+        assert!(!screen(ColorDepth::TrueColor, &mut chosen, 120, 34, false).contains("slower"));
     }
 
     // With too many hosts for lanes, each gets a line, and their figures line up whatever
