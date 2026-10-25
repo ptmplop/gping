@@ -23,6 +23,20 @@ impl Target {
         }
     }
 
+    /// A hostname that has to be resolved to an IPv4 address. An IPv4 address needs no
+    /// telling, and ping flags that say so are not understood by every ping (BusyBox
+    /// built without IPv6, Android's).
+    #[cfg(unix)]
+    pub(crate) fn is_ipv4_hostname(&self) -> bool {
+        matches!(
+            self,
+            Target::Hostname {
+                version: IPVersion::V4,
+                ..
+            }
+        )
+    }
+
     pub fn new_any(value: impl ToString) -> Self {
         let value = value.to_string();
         if let Ok(ip) = value.parse::<IpAddr>() {

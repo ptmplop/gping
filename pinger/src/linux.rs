@@ -1,4 +1,6 @@
-use crate::{extract_regex, run_ping, PingCreationError, PingOptions, PingResult, Pinger};
+use crate::{
+    extract_regex, interval_arg, run_ping, PingCreationError, PingOptions, PingResult, Pinger,
+};
 use lazy_regex::*;
 
 pub static UBUNTU_RE: Lazy<Regex> = lazy_regex!(r"(?i-u)time=(?P<ms>\d+)(?:\.(?P<ns>\d+))? *ms");
@@ -15,8 +17,8 @@ impl LinuxPinger {
     pub fn detect_platform_ping(options: PingOptions) -> Result<Self, PingCreationError> {
         let child = run_ping("ping", vec!["-V".to_string()])?;
         let output = child.wait_with_output()?;
-        let stdout = String::from_utf8(output.stdout).expect("Error decoding ping stdout");
-        let stderr = String::from_utf8(output.stderr).expect("Error decoding ping stderr");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
         if stderr.contains("BusyBox") {
             Ok(LinuxPinger::BusyBox(options))
@@ -53,7 +55,8 @@ impl Pinger for LinuxPinger {
             eprintln!("Got line {line}");
             if line.contains("bytes from") {
                 return extract_regex(&UBUNTU_RE, line);
-            } else if line.starts_with("no answer yet") {
+            } else if line.contains("no answer yet") {
+                // Not `starts_with`: with `-D` the line starts with a timestamp.
                 return Some(PingResult::Timeout(line));
             }
             None
@@ -61,53 +64,61 @@ impl Pinger for LinuxPinger {
     }
 
     fn ping_args(&self) -> (&str, Vec<String>) {
-        match self {
-            // Alpine doesn't support timeout notifications, so we don't add the -O flag here.
-            LinuxPinger::BusyBox(options) => {
-                let cmd = "ping";
-
-                let mut args = vec![
-                    options.target.to_string(),
-                    format!("-i{:.1}", options.interval.as_millis() as f32 / 1_000_f32),
-                ];
-
-                if options.target.is_ipv6() {
-                    args.push("-6".to_string());
-                }
-
-                if let Some(raw_args) = &options.raw_arguments {
-                    args.extend(raw_args.iter().cloned());
-                }
-
-                (cmd, args)
-            }
-            LinuxPinger::IPTools(options) => {
-                let cmd = "ping";
-
-                // The -O flag ensures we "no answer yet" messages from ping
-                // See https://superuser.com/questions/270083/linux-ping-show-time-out
-                let mut args = vec![
-                    "-O".to_string(),
-                    format!("-i{:.1}", options.interval.as_millis() as f32 / 1_000_f32),
-                ];
-
-                if options.target.is_ipv6() {
-                    args.push("-6".to_string());
-                }
-
-                if let Some(interface) = &options.interface {
-                    args.push("-I".into());
-                    args.push(interface.clone());
-                }
-                if let Some(raw_args) = &options.raw_arguments {
-                    args.extend(raw_args.iter().cloned());
-                }
-
-                args.push(options.target.to_string());
-                (cmd, args)
-            }
+        let (LinuxPinger::BusyBox(options) | LinuxPinger::IPTools(options)) = self;
+        let mut args = vec![];
+        // Alpine doesn't support timeout notifications, so we don't add the -O flag there.
+        if let LinuxPinger::IPTools(_) = self {
+            // The -O flag ensures we "no answer yet" messages from ping
+            // See https://superuser.com/questions/270083/linux-ping-show-time-out
+            args.push("-O".to_string());
         }
+        args.push(interval_arg(options.interval));
+
+        // Without either flag ping uses whichever address the resolver lists first,
+        // which on a dual-stack host is usually IPv6, whatever -4 asked for.
+        let mut cmd = "ping";
+        if options.target.is_ipv6() {
+            if ping_understands_dash_6() {
+                args.push("-6".to_string());
+            } else {
+                cmd = "ping6";
+            }
+        } else if options.target.is_ipv4_hostname() {
+            args.push("-4".to_string());
+        }
+
+        // BusyBox takes -I too (an interface name or a source address).
+        if let Some(interface) = &options.interface {
+            args.push("-I".into());
+            args.push(interface.clone());
+        }
+        if let Some(raw_args) = &options.raw_arguments {
+            args.extend(raw_args.iter().cloned());
+        }
+
+        // Last, after every option: a getopt that does not permute stops at the first
+        // operand and would take everything after it for more operands.
+        args.push(options.target.to_string());
+        (cmd, args)
     }
+}
+
+/// Whether `ping` takes -6. Android still ships iputils s20121221, from before ping and
+/// ping6 were merged: its ping is IPv4 only and rejects -6, and IPv6 needs ping6.
+#[cfg(target_os = "android")]
+fn ping_understands_dash_6() -> bool {
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| {
+        run_ping("ping", vec!["-6", "-V"])
+            .and_then(|child| Ok(child.wait_with_output()?))
+            .map(|output| output.status.success())
+            .unwrap_or(true)
+    })
+}
+
+#[cfg(not(target_os = "android"))]
+fn ping_understands_dash_6() -> bool {
+    true
 }
 
 #[cfg(test)]

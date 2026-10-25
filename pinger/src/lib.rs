@@ -18,10 +18,11 @@
 use lazy_regex::Regex;
 use std::ffi::OsStr;
 use std::fmt::{Debug, Formatter};
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::io::{BufRead, BufReader, Read};
+use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{fmt, io, thread};
 use target::Target;
 use thiserror::Error;
@@ -37,6 +38,7 @@ pub mod windows;
 mod bsd;
 #[cfg(feature = "fake-ping")]
 mod fake;
+mod loss;
 mod target;
 #[cfg(test)]
 mod test;
@@ -172,30 +174,97 @@ pub trait Pinger: Send + Sync {
 
         let mut child = run_ping(cmd, args)?;
         let stdout = child.stdout.take().expect("child did not have a stdout");
+        let stderr = child.stderr.take().expect("child did not have a stderr");
+
+        // ping writes to stderr for every packet it fails to send ("ping: sendto: No
+        // route to host" on macOS and the BSDs, for as long as an outage lasts). The pipe
+        // only holds 64KiB: unless something keeps reading it, ping ends up blocked in
+        // write(2) for good and no further results arrive, even once the network is back.
+        let stderr_reader = thread::spawn(move || read_stderr_tail(stderr));
 
         let parse_fn = self.parse_fn();
-
+        let (line_tx, line_rx) = mpsc::channel();
         thread::spawn(move || {
-            let reader = BufReader::new(stdout).lines();
-            for line in reader {
-                match line {
-                    Ok(msg) => {
-                        if let Some(result) = parse_fn(msg) {
-                            if tx.send(result).is_err() {
-                                break;
-                            }
-                        }
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if let Some(result) = parse_fn(line) {
+                    if line_tx.send(result).is_err() {
+                        break;
                     }
-                    Err(_) => break,
                 }
             }
-            let result = child.wait_with_output().expect("Child wasn't started?");
-            let decoded_stderr = String::from_utf8(result.stderr).expect("Error decoding stderr");
-            let _ = tx.send(PingResult::PingExited(result.status, decoded_stderr));
+        });
+
+        thread::spawn(move || {
+            // A timeout reported by ping is only provisional: see `loss`.
+            let mut tracker = loss::LossTracker::default();
+            loop {
+                let received = match tracker.next_deadline() {
+                    Some(deadline) => {
+                        line_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    }
+                    None => line_rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+                };
+                let now = Instant::now();
+                let mut results = match received {
+                    Ok(result) => tracker.on_result(result, now),
+                    Err(RecvTimeoutError::Timeout) => vec![],
+                    // stdout is closed: ping has exited, or is about to.
+                    Err(RecvTimeoutError::Disconnected) => break,
+                };
+                results.extend(tracker.expire(now));
+                for result in results {
+                    if tx.send(result).is_err() {
+                        // Nobody is listening any more, so stop pinging.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return;
+                    }
+                }
+            }
+            for result in tracker.finish() {
+                let _ = tx.send(result);
+            }
+            let status = child.wait().expect("Child wasn't started?");
+            let stderr = stderr_reader.join().unwrap_or_default();
+            let _ = tx.send(PingResult::PingExited(status, stderr));
         });
 
         Ok(rx)
     }
+}
+
+/// Reads ping's stderr until it closes, keeping the end of it for `PingExited`.
+fn read_stderr_tail(mut stderr: ChildStderr) -> String {
+    const KEEP: usize = 4096;
+    let mut kept = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stderr.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                kept.extend_from_slice(&buf[..n]);
+                if kept.len() > 2 * KEEP {
+                    kept.drain(..kept.len() - KEEP);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    if kept.len() > KEEP {
+        kept.drain(..kept.len() - KEEP);
+    }
+    // ping echoes things like the hostname back; never panic over its encoding.
+    String::from_utf8_lossy(&kept).into_owned()
+}
+
+/// The `-i` argument for ping: the interval in seconds, to the millisecond. ping takes
+/// fractional seconds, and rounding to a tenth turned `-n 0.25` into 0.2s and
+/// `-n 0.04` into `-i0.0`, which iputils refuses for users and floods with for root.
+#[cfg(unix)]
+pub(crate) fn interval_arg(interval: Duration) -> String {
+    format!("-i{}.{:03}", interval.as_secs(), interval.subsec_millis())
 }
 
 #[derive(Debug)]
@@ -243,12 +312,44 @@ pub enum PingCreationError {
     InternalError(String),
 }
 
-pub fn get_pinger(options: PingOptions) -> std::result::Result<Arc<dyn Pinger>, PingCreationError> {
+/// The shortest interval a pinger will use.
+pub const MIN_INTERVAL: Duration = Duration::from_millis(1);
+
+/// How long after a ping was lost the `Timeout` for it is reported. A missing reply can only
+/// be called lost once its packet has had time to be answered, so it is reported this much
+/// later than it happened; callers that plot results against time can move it back.
+pub fn timeout_delay(options: &PingOptions) -> Duration {
+    if fake_ping_requested() {
+        return Duration::ZERO;
+    }
+    match options.mode {
+        PingMode::TCP { .. } => tcp::connect_timeout(options.interval),
+        // ping reports the timeout, which is then held back for `LATE_REPLY_GRACE`.
+        #[cfg(unix)]
+        PingMode::ICMP => loss::LATE_REPLY_GRACE,
+        // IcmpSendEcho gives up after winping's default timeout.
+        #[cfg(windows)]
+        PingMode::ICMP => Duration::from_secs(2),
+    }
+}
+
+fn fake_ping_requested() -> bool {
+    cfg!(feature = "fake-ping")
+        && std::env::var("PINGER_FAKE_PING")
+            .map(|e| e == "1")
+            .unwrap_or_default()
+}
+
+pub fn get_pinger(
+    mut options: PingOptions,
+) -> std::result::Result<Arc<dyn Pinger>, PingCreationError> {
+    // A shorter interval would reach ping as `-i0.000`, a flood ping for root, and would
+    // make the TCP pinger spin: `connect_timeout` refuses a zero timeout, and it sleeps zero
+    // between tries.
+    options.interval = options.interval.max(MIN_INTERVAL);
+
     #[cfg(feature = "fake-ping")]
-    if std::env::var("PINGER_FAKE_PING")
-        .map(|e| e == "1")
-        .unwrap_or_default()
-    {
+    if fake_ping_requested() {
         return Ok(Arc::new(fake::FakePinger::from_options(options)?));
     }
 

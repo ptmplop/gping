@@ -1,5 +1,5 @@
 use crate::bsd::parse_bsd;
-use crate::{PingCreationError, PingOptions, PingResult, Pinger};
+use crate::{interval_arg, PingCreationError, PingOptions, PingResult, Pinger};
 use lazy_regex::*;
 
 pub static RE: Lazy<Regex> = lazy_regex!(r"time=(?:(?P<ms>[0-9]+).(?P<ns>[0-9]+)\s+ms)");
@@ -21,20 +21,13 @@ impl Pinger for MacOSPinger {
     }
 
     fn ping_args(&self) -> (&str, Vec<String>) {
-        let cmd = if self.options.target.is_ipv6() {
-            "ping6"
-        } else {
-            "ping"
-        };
-        let mut args = vec![
-            format!(
-                "-i{:.1}",
-                self.options.interval.as_millis() as f32 / 1_000_f32
-            ),
-            self.options.target.to_string(),
-        ];
+        let ipv6 = self.options.target.is_ipv6();
+        let cmd = if ipv6 { "ping6" } else { "ping" };
+        let mut args = vec![interval_arg(self.options.interval)];
         if let Some(interface) = &self.options.interface {
-            args.push("-b".into());
+            // ping binds to an interface with -b, ping6 with -B: its -b is the socket
+            // buffer size, and "-b en0" makes it exit with "invalid socket buffer size".
+            args.push(if ipv6 { "-B" } else { "-b" }.into());
             args.push(interface.clone());
         }
 
@@ -42,6 +35,7 @@ impl Pinger for MacOSPinger {
             args.extend(raw_args.iter().cloned());
         }
 
+        args.push(self.options.target.to_string());
         (cmd, args)
     }
 }

@@ -2,7 +2,8 @@ type Host = String;
 
 pub fn try_host_from_cloud_region(query: &str) -> Option<Host> {
     match query.split_once(':') {
-        Some(("aws", region)) => Some(format!("ec2.{region}.amazonaws.com")),
+        // Not ec2.<region>: the EC2 API endpoints drop ICMP, so they never answer a ping.
+        Some(("aws", region)) => Some(format!("dynamodb.{region}.amazonaws.com")),
         Some(("gcp", "")) => Some("cloud.google.com".to_string()),
         Some(("gcp", region)) => Some(format!("storage.{region}.rep.googleapis.com")),
         _ => None,
@@ -17,7 +18,7 @@ mod tests {
     fn test_host_from_aws() {
         assert_eq!(
             try_host_from_cloud_region("aws:eu-west-1"),
-            Some("ec2.eu-west-1.amazonaws.com".to_string())
+            Some("dynamodb.eu-west-1.amazonaws.com".to_string())
         );
     }
 
