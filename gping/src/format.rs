@@ -155,7 +155,12 @@ pub fn duration(secs: f64) -> String {
 /// Formats a ratio in `0..=1` as a percentage with at most one decimal (`0%`, `2.5%`, `100%`).
 pub fn percent(ratio: f64) -> String {
     let pct = (ratio * 100.0).clamp(0.0, 100.0);
-    if pct == 0.0 || pct >= 99.95 || (pct - pct.round()).abs() < 0.05 {
+    // Some loss is never "0%", and some replies are never "100%" lost.
+    if pct > 0.0 && pct < 0.05 {
+        "<0.1%".to_string()
+    } else if (99.95..100.0).contains(&pct) {
+        ">99.9%".to_string()
+    } else if pct == 0.0 || pct == 100.0 || (pct - pct.round()).abs() < 0.05 {
         format!("{pct:.0}%")
     } else {
         format!("{pct:.1}%")
@@ -290,5 +295,7 @@ mod tests {
         assert_eq!(percent(1.0 / 3.0), "33.3%");
         assert_eq!(percent(1.0), "100%");
         assert_eq!(percent(0.5), "50%");
+        assert_eq!(percent(3.0 / 12_345.0), "<0.1%");
+        assert_eq!(percent(2_999.0 / 3_000.0), ">99.9%");
     }
 }

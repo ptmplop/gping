@@ -1,9 +1,9 @@
 //! Everything around the lanes: the title bar, the time axis, the key bar, and the
 //! one-line host rows used when there's no room for lanes.
 
-use super::draw::{put, spans, spans_right, truncate, width};
+use super::draw::{put, shorten_middle, spans, spans_right, width};
 use super::{HostView, ScaleMode, Scene};
-use crate::app::{grade, Readout, Status};
+use crate::app::{grade, HostState, Readout, Status};
 use crate::format;
 use crate::theme::SHAPES;
 use tui::buffer::Buffer;
@@ -43,8 +43,11 @@ pub fn masthead(
     super::draw::fill(buf, rect, t.mast);
     let (y, right) = (rect.y, rect.right());
 
-    // Right: how the hosts are doing, the clock, and how long gping has been running.
-    let mut parts: Vec<(String, Style)> = Vec::new();
+    // Right: how the hosts are doing, the clock, and how long gping has been running. Each
+    // part has a weight: when they don't all fit beside the name, the lightest goes first.
+    // That is the uptime, then the clock, then the counts of hosts doing fine before the
+    // ones in trouble; PAUSED stays.
+    let mut parts: Vec<(String, Style, u8)> = Vec::new();
     let mut counts: Vec<(Status, usize)> = Vec::new();
     for &i in visible {
         let status = views[i].status;
@@ -54,46 +57,45 @@ pub fn masthead(
         }
     }
     let order = [
-        Status::Down,
-        Status::Failed,
-        Status::Lossy,
-        Status::Slow,
-        Status::Steady,
-        Status::Waiting,
-        Status::Finished,
+        (Status::Down, 9),
+        (Status::Failed, 8),
+        (Status::Lossy, 7),
+        (Status::Slow, 6),
+        (Status::Steady, 4),
+        (Status::Waiting, 5),
+        (Status::Finished, 3),
     ];
-    for status in order {
+    for (status, weight) in order {
         if let Some(&(_, n)) = counts.iter().find(|(s, _)| *s == status) {
             let (word, glyph, (color, _)) = status_badge(scene, status);
             let word = if status == Status::Steady { "ok" } else { word };
-            parts.push((format!("{glyph} {n} {word}"), bold(color)));
-            parts.push(("  ".into(), Style::default()));
+            parts.push((format!("{glyph} {n} {word}  "), bold(color), weight));
         }
     }
     let clock = scene.wall_now.format("%H:%M:%S").to_string();
     let ran = format::elapsed(scene.now.max(0.0) as u64);
     if scene.closing {
-        parts.push(("■ stopped ".into(), bold(t.idle.0)));
-        parts.push((clock, bold(t.text)));
-        parts.push((format!("  ran {ran} "), fg(t.muted)));
+        parts.push(("■ stopped ".into(), bold(t.idle.0), 10));
+        parts.push((clock, bold(t.text), 2));
+        parts.push((format!("  ran {ran}"), fg(t.muted), 1));
     } else {
         if scene.paused() {
-            parts.push((" PAUSED ".into(), bold(t.warn.0).bg(t.warn.1)));
-            parts.push(("  ".into(), Style::default()));
+            parts.push((" PAUSED ".into(), bold(t.warn.0).bg(t.warn.1), 10));
+            parts.push(("  ".into(), Style::default(), 10));
         }
-        parts.push((clock, bold(t.text)));
-        parts.push((format!("  up {ran} "), fg(t.muted)));
+        parts.push((clock, bold(t.text), 2));
+        parts.push((format!("  up {ran}"), fg(t.muted), 1));
     }
-    // Drop the counts, then the uptime, until the right side fits beside the name.
-    let mut right_parts: Vec<(&str, Style)> =
-        parts.iter().map(|(s, st)| (s.as_str(), *st)).collect();
+    parts.push((" ".into(), Style::default(), 10));
     let mut left_end = rect.x + 9;
-    while !right_parts.is_empty() {
-        if let Some(x) = spans_right(buf, right, y, &right_parts, rect.x + 10) {
+    while !parts.is_empty() {
+        let shown: Vec<(&str, Style)> = parts.iter().map(|(s, st, _)| (s.as_str(), *st)).collect();
+        if let Some(x) = spans_right(buf, right, y, &shown, rect.x + 10) {
             left_end = x;
             break;
         }
-        right_parts.remove(0);
+        let lightest = (0..parts.len()).min_by_key(|&i| parts[i].2).unwrap_or(0);
+        parts.remove(lightest);
     }
 
     // Left: the name, then what is being measured and how, as much as fits.
@@ -118,6 +120,10 @@ pub fn masthead(
     }
     if n > 1 {
         facts.push(format!("{n} hosts"));
+    }
+    let hidden = n - visible.len();
+    if hidden > 0 {
+        facts.push(format!("{hidden} hidden"));
     }
     facts.push(format!("every {}", seconds(scene.options.interval)));
     facts.push(format!("{} window", seconds(scene.app.window)));
@@ -171,8 +177,9 @@ pub fn time_axis(buf: &mut Buffer, rect: Rect, scene: &Scene) {
     let mut k = 0u32;
     loop {
         let (time, label) = if absolute {
-            // On whole multiples of the step, in wall-clock time.
-            let end = scene.wall(x1).timestamp() as f64;
+            // On whole multiples of the step, in wall-clock time (to the millisecond: whole
+            // seconds would put every label up to a second late).
+            let end = scene.wall(x1).timestamp_millis() as f64 / 1000.0;
             let first = (end / step).floor() * step;
             let at = first - k as f64 * step;
             let time = x1 - (end - at);
@@ -231,24 +238,40 @@ pub fn footer(buf: &mut Buffer, rect: Rect, scene: &Scene, views: &[HostView]) {
         } else {
             lost as f64 / sent as f64
         };
-        let mut parts = vec![
-            (format!(" gping {}", env!("CARGO_PKG_VERSION")), fg(t.soft)),
-            ("  ·  ".to_string(), fg(t.muted)),
-            (format!("{} sent", thousands(sent)), fg(t.soft)),
-            ("  ·  ".to_string(), fg(t.muted)),
-        ];
-        if lost == 0 {
-            parts.push(("none lost".to_string(), fg(t.good.0)));
-        } else {
-            parts.push((
-                format!("{} lost ({})", thousands(lost), format::percent(loss)),
-                bold(t.loss),
-            ));
+        // Whole pieces go when it's narrow, the least telling first: the version, what the
+        // chart covered, then the percentage.
+        for (version, chart, percent) in [
+            (true, true, true),
+            (false, true, true),
+            (false, false, true),
+            (false, false, false),
+        ] {
+            let mut parts = vec![(" ".to_string(), Style::default())];
+            if version {
+                parts.push((format!("gping {}", env!("CARGO_PKG_VERSION")), fg(t.soft)));
+                parts.push(("  ·  ".to_string(), fg(t.muted)));
+            }
+            parts.push((format!("{} sent", thousands(sent)), fg(t.soft)));
+            parts.push(("  ·  ".to_string(), fg(t.muted)));
+            parts.push(if lost == 0 {
+                ("none lost".to_string(), fg(t.good.0))
+            } else if percent {
+                let text = format!("{} lost ({})", thousands(lost), format::percent(loss));
+                (text, bold(t.loss))
+            } else {
+                (format!("{} lost", thousands(lost)), bold(t.loss))
+            });
+            if chart {
+                parts.push(("  ·  ".to_string(), fg(t.muted)));
+                parts.push((format!("chart: last {}", seconds(app.window)), fg(t.muted)));
+            }
+            let parts: Vec<(&str, Style)> = parts.iter().map(|(s, st)| (s.as_str(), *st)).collect();
+            let fits = parts.iter().map(|(s, _)| width(s)).sum::<u16>() <= rect.width;
+            if fits || !percent {
+                spans(buf, rect.x, y, &parts, right);
+                return;
+            }
         }
-        parts.push(("  ·  ".to_string(), fg(t.muted)));
-        parts.push((format!("chart: last {}", seconds(app.window)), fg(t.muted)));
-        let parts: Vec<(&str, Style)> = parts.iter().map(|(s, st)| (s.as_str(), *st)).collect();
-        spans(buf, rect.x, y, &parts, right);
         return;
     }
 
@@ -271,9 +294,18 @@ pub fn footer(buf: &mut Buffer, rect: Rect, scene: &Scene, views: &[HostView]) {
         ("✕", bold(t.loss)),
         (" lost ", fg(t.muted)),
     ];
-    let has_heat = views.iter().any(|v| v.baseline.is_some());
+    let short = [
+        ("━━━", fg(heat[0])),
+        (" slow  ", fg(t.muted)),
+        ("✕", bold(t.loss)),
+        (" lost ", fg(t.muted)),
+    ];
+    // Heat only once a host has a baseline to be slower than, and never without colour.
+    let has_heat = t.shows_heat && views.iter().any(|v| v.baseline.is_some());
     let limit = if rect.width >= 90 && has_heat {
         spans_right(buf, right, y, &legend, rect.x + 40).unwrap_or(right)
+    } else if rect.width >= 60 && has_heat {
+        spans_right(buf, right, y, &short, rect.x + 40).unwrap_or(right)
     } else if rect.width >= 60 {
         spans_right(buf, right, y, &legend[4..], rect.x + 40).unwrap_or(right)
     } else {
@@ -307,16 +339,38 @@ pub fn host_line(buf: &mut Buffer, rect: Rect, scene: &Scene, view: &HostView) {
     let (y, right) = (rect.y, rect.right());
     let shape = SHAPES[view.index % SHAPES.len()];
     let (word, _, (color, _)) = status_badge(scene, view.status);
-    let value = match view.readout {
-        Readout::Value(us) => {
-            let g = view.baseline.map_or(0, |b| grade(us, b));
-            (format::latency(us), bold(t.graded(g, t.text)))
+    let session = &host.session;
+    // As on the cards: the session in the final frame, the moment before that.
+    let value = if matches!(host.state, HostState::Failed(_)) {
+        ("failed".to_string(), bold(t.loss))
+    } else if scene.closing {
+        match session.mean() {
+            Some(mean) => (format!("avg {}", format::latency(mean)), bold(t.text)),
+            None if session.sent > 0 => ("no replies".to_string(), bold(t.loss)),
+            None => ("-".to_string(), fg(t.muted)),
         }
-        Readout::Lost => ("lost".to_string(), bold(t.loss)),
-        Readout::NoReply(s) => (format!("down {}", format::elapsed(s as u64)), bold(t.loss)),
-        Readout::Waiting => ("…".to_string(), fg(t.muted)),
+    } else {
+        match view.readout {
+            Readout::Value(us) => {
+                let g = view.baseline.map_or(0, |b| grade(us, b));
+                (format::latency(us), bold(t.graded(g, t.text)))
+            }
+            Readout::Lost => ("lost".to_string(), bold(t.loss)),
+            Readout::NoReply(s) => (format!("down {}", format::elapsed(s as u64)), bold(t.loss)),
+            Readout::Waiting => ("…".to_string(), fg(t.muted)),
+        }
     };
-    let loss = view.summary.map_or(0.0, |s| s.loss());
+    let loss = if scene.closing {
+        session.loss()
+    } else {
+        view.summary.map_or(0.0, |s| s.loss())
+    };
+    // The status word is padded to the longest, so that the columns before it line up.
+    let word = if scene.closing {
+        String::new()
+    } else {
+        format!("  {word:<7}")
+    };
     let tail = [
         (format!("{:>8}", value.0), value.1),
         ("  ".to_string(), Style::default()),
@@ -328,7 +382,7 @@ pub fn host_line(buf: &mut Buffer, rect: Rect, scene: &Scene, view: &HostView) {
                 fg(t.muted)
             },
         ),
-        (format!("  {word}"), fg(color)),
+        (word, fg(color)),
     ];
     let tail_parts: Vec<(&str, Style)> = tail.iter().map(|(s, st)| (s.as_str(), *st)).collect();
     // Drop the status word, then the loss, when it gets tight.
@@ -347,7 +401,7 @@ pub fn host_line(buf: &mut Buffer, rect: Rect, scene: &Scene, view: &HostView) {
         &[
             (shape, fg(host.color)),
             (" ", Style::default()),
-            (&truncate(&host.name, name_room), bold(host.color)),
+            (&shorten_middle(&host.name, name_room), bold(host.color)),
         ],
         end,
     );

@@ -87,6 +87,8 @@ pub struct Theme {
     pub curtain: Option<Color>,
     /// Slower than usual: elevated, high, critical.
     pub heat: [Color; 3],
+    /// Whether the heat colours can be seen at all (not without colour).
+    pub shows_heat: bool,
     /// Whether to tint the area under each line.
     pub fills: bool,
     /// Whether the big digits use the light line set, for console fonts.
@@ -117,6 +119,7 @@ impl Theme {
             loss: rgb(LOSS),
             curtain: Some(rgb(mix(BASE, LOSS, 0.16))),
             heat: [hex(0xffc145), hex(0xff8a3d), hex(0xff4d4d)],
+            shows_heat: true,
             fills: true,
             light_digits: false,
         };
@@ -146,7 +149,9 @@ impl Theme {
                 theme.bad = (Color::LightRed, Color::Reset);
                 theme.idle = (Color::Gray, Color::Reset);
                 theme.loss = Color::LightRed;
-                theme.curtain = Some(Color::Red);
+                // A solid red block, as loud as the trace, and on palettes where red and
+                // bright red are one colour (many) it hides the ✕ marks drawn over it.
+                theme.curtain = None;
                 theme.heat = [Color::Yellow, Color::LightRed, Color::Red];
                 theme.fills = false;
                 theme.light_digits = true;
@@ -156,6 +161,7 @@ impl Theme {
                 theme.panel = Color::Reset;
                 theme.mast = Color::Reset;
                 theme.curtain = None;
+                theme.shows_heat = false;
                 theme.fills = false;
                 theme.light_digits = true;
             }

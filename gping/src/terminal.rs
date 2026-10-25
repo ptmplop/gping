@@ -32,12 +32,15 @@ impl TerminalGuard {
         }));
 
         enable_raw_mode()?;
+        // From here on the guard puts the terminal back, even if the rest fails (as it does
+        // when stdout is a closed pipe).
+        let guard = TerminalGuard { alternate_screen };
         let mut stdout = io::stdout();
         if alternate_screen {
             execute!(stdout, EnterAlternateScreen)?;
         }
         execute!(stdout, Hide)?;
-        Ok(TerminalGuard { alternate_screen })
+        Ok(guard)
     }
 
     /// Restores the terminal now. On the main screen the cursor is left at the start of

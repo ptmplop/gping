@@ -61,16 +61,15 @@ pub fn plan(area: Rect, hosts: &[usize]) -> Plan {
         top += 1;
         Rect::new(area.x, area.y, w, 1)
     });
-    if h >= 30 {
-        top += 1;
-    }
+    // A blank row under the title bar, on tall screens.
+    let spacer = h >= 30;
     let footer = (h >= 8).then(|| {
         bottom -= 1;
         Rect::new(area.x, bottom, w, 1)
     });
     let rows = bottom.saturating_sub(top);
 
-    if let Some((lanes, axis)) = lanes(area.x, top, w, rows, hosts) {
+    if let Some((lanes, axis)) = lanes(area.x, top, w, rows, hosts, spacer) {
         return Plan {
             masthead,
             body: Body::Lanes(lanes),
@@ -81,6 +80,10 @@ pub fn plan(area: Rect, hosts: &[usize]) -> Plan {
     }
 
     // One line per host, and a line to say how many didn't fit.
+    if spacer {
+        top += 1;
+    }
+    let rows = bottom.saturating_sub(top);
     let fits = rows as usize;
     let (shown, more) = if fits == 0 {
         (0, None)
@@ -112,6 +115,7 @@ fn lanes(
     w: u16,
     rows: u16,
     hosts: &[usize],
+    spacer: bool,
 ) -> Option<(Vec<Lane>, Option<Rect>)> {
     let n = hosts.len() as u16;
     if n == 0 {
@@ -124,6 +128,9 @@ fn lanes(
     } else {
         0
     };
+    // Every lane the same height, so that one latency sits at one height in each on a shared
+    // scale, and every card is laid out alike. A row to spare goes to the spacer under the
+    // title bar (which never takes one from the lanes), any others under the time axis.
     let height = rows.checked_sub(gap * (n - 1))? / n;
     if height < 2 {
         return None;
@@ -146,11 +153,10 @@ fn lanes(
     };
     let hist = if w >= 100 && height >= 4 { HIST + 1 } else { 0 };
     let mut lanes = Vec::with_capacity(hosts.len());
-    let mut y = top;
+    let mut y = top + u16::from(spacer && spare > 0);
     let mut plot_span = (0, 0);
-    for (i, &host) in hosts.iter().enumerate() {
-        // Rows that don't divide evenly go to the first lanes.
-        let h = height + u16::from((i as u16) < spare);
+    for &host in hosts {
+        let h = height;
         let plot_w = w.checked_sub(GUTTER + hist + 1 + card_w)?;
         if plot_w < MIN_PLOT {
             return None;
@@ -260,12 +266,12 @@ mod tests {
         assert_eq!(lanes.len(), 3);
         assert!(lanes.iter().all(|l| l.kind == CardKind::Full));
         assert!(lanes.iter().all(|l| l.hist.is_some()));
-        assert!(lanes[0].plot.height >= 8, "{:?}", lanes[0]);
+        assert!(lanes.iter().all(|l| l.plot.height == 8), "{:?}", lanes);
         assert!(plan.masthead.is_some() && plan.footer.is_some() && plan.axis.is_some());
     }
 
-    // Rows that don't divide evenly make some lanes a row taller, but every lane still gets
-    // the same card, so the plots stay lined up over the shared time axis.
+    // Every lane gets the same height and card, however the rows divide, so the plots line
+    // up over the shared time axis and a shared scale means the same in each.
     #[test]
     fn lanes_line_up() {
         for rows in 20..60 {
@@ -275,7 +281,8 @@ mod tests {
             };
             assert!(lanes.windows(2).all(|w| w[0].kind == w[1].kind
                 && w[0].plot.x == w[1].plot.x
-                && w[0].plot.width == w[1].plot.width));
+                && w[0].plot.width == w[1].plot.width
+                && w[0].plot.height == w[1].plot.height));
             assert_eq!(plan.axis.unwrap().width, lanes[0].plot.width);
         }
     }

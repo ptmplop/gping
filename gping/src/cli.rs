@@ -43,16 +43,16 @@ pub struct Args {
     pub buffer: u64,
 
     /// Resolve ping targets to IPv4 address
-    #[arg(short = '4', conflicts_with = "ipv6")]
+    #[arg(short = '4', conflicts_with_all = ["ipv6", "cmd"])]
     pub ipv4: bool,
 
     /// Resolve ping targets to IPv6 address
-    #[arg(short = '6', conflicts_with = "ipv4")]
+    #[arg(short = '6', conflicts_with_all = ["ipv4", "cmd"])]
     pub ipv6: bool,
 
     #[cfg(not(target_os = "windows"))]
     /// Interface to use when pinging.
-    #[arg(short = 'i', long, conflicts_with = "tcp")]
+    #[arg(short = 'i', long, conflicts_with_all = ["tcp", "cmd"])]
     pub interface: Option<String>,
 
     /// Uses dot characters instead of braille
@@ -80,7 +80,7 @@ pub struct Args {
     pub ymin_zero: bool,
 
     /// Use TCP pings instead of ICMP
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "cmd")]
     pub tcp: bool,
 
     /// How to treat a connection refused (RST) when TCP pinging
@@ -174,6 +174,16 @@ mod tests {
         for bad in ["0", "-1", "nan", "inf", "abc", "7200"] {
             assert!(parse_interval(bad).is_err(), "{}", bad);
         }
+    }
+
+    // These do nothing to a command, so saying they were given (in the title bar) would mislead.
+    #[test]
+    fn ping_options_are_refused_with_cmd() {
+        for flag in ["-4", "-6", "--tcp"] {
+            assert!(Args::try_parse_from(["gping", "--cmd", flag, "true"]).is_err());
+        }
+        #[cfg(not(target_os = "windows"))]
+        assert!(Args::try_parse_from(["gping", "--cmd", "-i", "en0", "true"]).is_err());
     }
 
     #[test]

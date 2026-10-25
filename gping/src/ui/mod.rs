@@ -88,6 +88,10 @@ pub enum ScaleMode {
 /// How long a status badge blinks for when a host starts losing pings.
 const BLINK_SECONDS: f64 = 1.5;
 
+/// Samples are kept for at least this long, whatever the window: a host's status looks back
+/// ten seconds, and lost pings arrive seconds late, dated back to when they were sent.
+const KEEP_SECONDS: f64 = 60.0;
+
 pub struct Ui {
     options: UiOptions,
     theme: Theme,
@@ -216,15 +220,15 @@ impl Ui {
         let area = Rect {
             x: full.x + hm.min(full.width / 2),
             y: full.y + vm.min(full.height / 2),
-            width: full.width.saturating_sub(2 * hm),
-            height: full.height.saturating_sub(2 * vm),
+            width: full.width.saturating_sub(hm.saturating_mul(2)),
+            height: full.height.saturating_sub(vm.saturating_mul(2)),
         };
         let dt = self.last_draw.map_or(0.0, |last| (now - last).max(0.0));
         self.last_draw = Some(now);
 
         let x_bounds = app.x_bounds(now);
         for host in &mut app.hosts {
-            host.trim(x_bounds[0]);
+            host.trim(x_bounds[0].min(now - KEEP_SECONDS));
         }
         let n = app.hosts.len();
         self.hidden.resize(n, false);
@@ -234,7 +238,8 @@ impl Ui {
         let views: Vec<HostView> = (0..n)
             .map(|i| self.view(app, i, now, x_bounds, closing))
             .collect();
-        let visible: Vec<usize> = (0..n).filter(|&i| !self.hidden[i]).collect();
+        // The final frame reports on every host, hidden or not.
+        let visible: Vec<usize> = (0..n).filter(|&i| closing || !self.hidden[i]).collect();
         let plan = layout::plan(area, &visible);
 
         let buf = frame.buffer_mut();
@@ -304,7 +309,14 @@ impl Ui {
             chrome::footer(buf, rect, &scene, &views);
         }
         if self.help && !closing {
-            help::draw(buf, area, &scene);
+            let room = match &plan.body {
+                Body::Lanes(lanes) if !lanes.is_empty() => Rect {
+                    width: lanes[0].card.x.saturating_sub(area.x),
+                    ..area
+                },
+                _ => area,
+            };
+            help::draw(buf, area, room, &scene);
         }
 
         if views.iter().any(|v| v.blink)
@@ -386,7 +398,7 @@ impl Ui {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Host;
+    use crate::app::{Host, HostState};
     use crate::theme::SERIES;
     use tui::backend::TestBackend;
     use tui::style::Color;
@@ -518,6 +530,185 @@ mod tests {
         }
         // Lost pings are marked on the rails.
         assert!(screen.contains('✕'));
+    }
+
+    fn screen(depth: ColorDepth, app: &mut App, w: u16, h: u16, closing: bool) -> String {
+        text(&render(&mut Ui::new(options(depth)), app, w, h, closing))
+    }
+
+    fn row(screen: &str, y: usize) -> &str {
+        screen.lines().nth(y).unwrap_or_default()
+    }
+
+    /// A host whose ping `k`, taken every 0.2s for 40 seconds, got the reply `reply(k)`.
+    fn host(i: usize, name: &str, reply: impl Fn(usize) -> Option<u64>) -> Host {
+        let c = SERIES[i % SERIES.len()];
+        let mut host = Host::new(name.into(), None, Color::Rgb(c.0, c.1, c.2), c);
+        for k in 0..200 {
+            host.record(k as f64 * 0.2, reply(k).map(Duration::from_millis));
+        }
+        host
+    }
+
+    // However small the cards, the final frame reports on the session: host 2 lost 36 of its
+    // 200 pings (18%), 34 of them in the last 30 seconds (23% of those).
+    #[test]
+    fn the_final_frame_reports_the_session_at_every_size() {
+        for (w, h, expected) in [
+            (120, 34, "lost 36 (18%)"),
+            (80, 24, "lost 36 (18%)"),
+            (60, 16, "18%"),
+        ] {
+            let report = screen(ColorDepth::TrueColor, &mut app(3), w, h, true);
+            assert!(report.contains(expected), "{}x{}:\n{}", w, h, report);
+            assert!(!report.contains("23%"), "{}x{}:\n{}", w, h, report);
+        }
+    }
+
+    #[test]
+    fn a_host_that_never_answered_is_reported_as_such() {
+        let mut app = app(2);
+        app.hosts[1] = host(1, "dead.example", |_| None);
+        for (w, h) in [(120, 34), (80, 24), (60, 16)] {
+            let report = screen(ColorDepth::TrueColor, &mut app, w, h, true);
+            assert!(report.contains("no replies"), "{}x{}:\n{}", w, h, report);
+            assert!(!report.contains("waiting"), "{}x{}:\n{}", w, h, report);
+        }
+    }
+
+    // A failed pinger has no samples, but "waiting…" would be wrong: it says why it failed.
+    #[test]
+    fn a_failed_host_says_why() {
+        let mut app = app(2);
+        app.hosts[1] = Host::new("2606:4700:4700::1111".into(), None, Color::Reset, (0, 0, 0));
+        app.hosts[1].state = HostState::Failed("ping6: UDP connect: No route to host".into());
+        let live = screen(ColorDepth::TrueColor, &mut app, 120, 34, false);
+        for expected in ["failed", "No route", "2606:4700:4700::1111"] {
+            assert!(
+                live.contains(expected),
+                "{} is missing from\n{}",
+                expected,
+                live
+            );
+        }
+        assert!(!live.contains("waiting"), "{}", live);
+    }
+
+    #[test]
+    fn hidden_hosts_are_still_in_the_report() {
+        let mut app = app(3);
+        let mut ui = Ui::new(options(ColorDepth::TrueColor));
+        ui.hidden = vec![false, true, false];
+        let live = text(&render(&mut ui, &mut app, 120, 34, false));
+        assert!(
+            !live.contains("host-1.example") && live.contains("1 hidden"),
+            "{}",
+            live
+        );
+        let report = text(&render(&mut ui, &mut app, 120, 34, true));
+        assert!(report.contains("host-1.example"), "{}", report);
+    }
+
+    // When the title bar runs out of room, a down host is the last thing to go.
+    #[test]
+    fn a_narrow_title_bar_keeps_the_bad_news() {
+        let mut app = app(3);
+        app.hosts[0] = host(0, "a", |k| (k < 150).then_some(10));
+        app.hosts[1] = host(1, "b", |k| (k != 195).then_some(10));
+        app.hosts[2] = host(2, "c", |_| Some(10));
+        let mut lost_ok = false;
+        for w in 30..=80 {
+            let title = row(&screen(ColorDepth::TrueColor, &mut app, w, 34, false), 1).to_string();
+            assert!(!title.contains("ok") || title.contains("down"), "{}", title);
+            lost_ok |= title.contains("down") && !title.contains("ok");
+        }
+        assert!(lost_ok, "at some width only the bad news fits");
+    }
+
+    #[test]
+    fn the_final_footer_drops_whole_pieces() {
+        let report = screen(ColorDepth::TrueColor, &mut app(3), 40, 12, true);
+        assert_eq!(
+            row(&report, 10).trim(),
+            "600 sent  ·  48 lost (8%)",
+            "{}",
+            report
+        );
+    }
+
+    #[test]
+    fn the_heat_legend_only_shows_where_heat_does() {
+        let mut app = app(3);
+        assert!(
+            screen(ColorDepth::TrueColor, &mut app, 120, 34, false).contains("slower than usual")
+        );
+        assert!(screen(ColorDepth::TrueColor, &mut app, 80, 24, false).contains("━━━ slow"));
+        assert!(!screen(ColorDepth::Mono, &mut app, 120, 34, false).contains("slower"));
+    }
+
+    // With too many hosts for lanes, each gets a line, and their figures line up whatever
+    // each one's status.
+    #[test]
+    fn host_lines_keep_their_columns() {
+        let mut app = app(10);
+        app.hosts[3].state = HostState::Finished;
+        let lines = screen(ColorDepth::TrueColor, &mut app, 80, 12, false);
+        let columns: Vec<usize> = lines
+            .lines()
+            .filter_map(|line| line.chars().position(|c| c == '%'))
+            .collect();
+        assert!(columns.len() >= 5, "{}", lines);
+        assert!(columns.windows(2).all(|w| w[0] == w[1]), "{}", lines);
+    }
+
+    #[test]
+    fn huge_margins_leave_nothing_to_draw() {
+        let mut opts = options(ColorDepth::TrueColor);
+        opts.vertical_margin = 40_000;
+        opts.horizontal_margin = 40_000;
+        render(&mut Ui::new(opts), &mut app(2), 120, 34, false);
+        render(
+            &mut Ui::new(options(ColorDepth::TrueColor)),
+            &mut app(2),
+            120,
+            34,
+            true,
+        );
+    }
+
+    // With a one-second window, a lost ping (dated back two seconds, to when it was sent) is
+    // off the chart before it is known about, but the host is still lossy for ten seconds.
+    #[test]
+    fn a_short_window_still_knows_about_losses() {
+        let mut app = app(1);
+        app.window = 1.0;
+        screen(ColorDepth::TrueColor, &mut app, 120, 34, false);
+        assert_eq!(app.hosts[0].status(40.0, 0.2), Status::Lossy);
+    }
+
+    // `-s` draws a dot per cell, not braille's four, so the labels have to follow suit. On
+    // 8 rows from 0 to 22 ms, braille puts 20 ms in the top row and a dot in the next.
+    #[test]
+    fn simple_graphics_labels_sit_on_their_gridlines() {
+        let mut opts = options(ColorDepth::TrueColor);
+        opts.simple_graphics = true;
+        let mut app = app(1);
+        app.yrange = (Some(0.0), Some(22_000.0));
+        let lines = text(&render(&mut Ui::new(opts), &mut app, 120, 14, false));
+        let mut labelled = 0;
+        for line in lines.lines() {
+            let cells: Vec<char> = line.chars().collect();
+            if cells.get(5) == Some(&'┤') {
+                labelled += 1;
+                assert!(
+                    cells[6..60].contains(&'·'),
+                    "no gridline at {:?}\n{}",
+                    line,
+                    lines
+                );
+            }
+        }
+        assert!(labelled >= 3, "{}", lines);
     }
 
     #[test]

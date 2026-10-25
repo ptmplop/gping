@@ -33,6 +33,18 @@ impl Marker {
     }
 }
 
+/// The dot row (0 at the top) a value falls on, in a plot `dots` dots high.
+fn dot_row([y0, y1]: [f64; 2], dots: usize, value: f64) -> f64 {
+    ((y1 - value) / (y1 - y0) * (dots as f64 - 1.0)).round()
+}
+
+/// The cell row (0 at the top) a value is drawn in, in a plot `rows` high, so that labels
+/// and bars beside a plot line up with what it draws.
+pub fn cell_row(value: f64, bounds: [f64; 2], rows: u16, marker: Marker) -> i64 {
+    let (_, ry) = marker.resolution();
+    (dot_row(bounds, rows as usize * ry, value) / ry as f64).floor() as i64
+}
+
 /// A background tint under a series' line, down to the floor of the plot. It starts at the
 /// line's typical level (a rolling median) rather than at the line itself, so a spike stays
 /// a crisp stroke instead of growing a tinted tower underneath.
@@ -126,9 +138,8 @@ impl Raster {
     /// Maps a latency to a dot row (0 at the top), unclamped but kept within a few plot
     /// heights so off-scale values can't make line drawing loop for long.
     fn y(&self, value: f64) -> i64 {
-        let [y0, y1] = self.y_bounds;
         let h = self.height as f64 - 1.0;
-        let row = ((y1 - value) / (y1 - y0) * h).round();
+        let row = dot_row(self.y_bounds, self.height, value);
         row.clamp(-2.0 * h - 2.0, 3.0 * h + 2.0) as i64
     }
 
@@ -288,7 +299,10 @@ impl Plot<'_> {
             let Some(g) = series.glow else { continue };
             // The replies in each cell column, to find the line's typical level by.
             let mut values: Vec<Vec<f64>> = vec![Vec::new(); w];
-            for &(t, v) in series.samples {
+            let samples = series.samples;
+            let first = samples.partition_point(|(t, _)| *t <= self.x_bounds[0]);
+            let last = samples.partition_point(|(t, _)| *t <= self.x_bounds[1]);
+            for &(t, v) in &samples[first..last.max(first)] {
                 let x = raster.x(t);
                 if !v.is_nan() && x >= 0 && (x as usize) < raster.width {
                     values[x as usize / rx].push(v);
@@ -307,10 +321,9 @@ impl Plot<'_> {
                 let anchor = if around.is_empty() {
                     top
                 } else {
-                    around.sort_by(f64::total_cmp);
-                    let typical = raster
-                        .y(around[around.len() / 2])
-                        .clamp(0, raster.height as i64 - 1);
+                    let middle = around.len() / 2;
+                    let (_, median, _) = around.select_nth_unstable_by(middle, f64::total_cmp);
+                    let typical = raster.y(*median).clamp(0, raster.height as i64 - 1);
                     (typical as usize).max(top)
                 };
                 let (first_row, offset) = (anchor / ry, anchor % ry);

@@ -44,11 +44,12 @@ pub fn start_ping(options: PingOptions, host: usize, tx: Sender<Event>) -> Resul
                     Event::Ended(host, HostState::Finished)
                 }
                 PingResult::PingExited(status, stderr) => {
+                    // What ping said first, where a narrow card has room for it.
                     let detail = stderr.trim();
                     let message = if detail.is_empty() {
                         format!("ping exited with {status}")
                     } else {
-                        format!("ping exited with {status}: {detail}")
+                        format!("{detail} ({status})")
                     };
                     Event::Ended(host, HostState::Failed(message))
                 }
@@ -246,14 +247,34 @@ pub fn start_input(tx: Sender<Event>, stop: Arc<AtomicBool>) {
 
 /// Turns SIGTERM, SIGINT and SIGHUP into an orderly quit, so the terminal is restored
 /// even when gping is stopped from outside (`timeout`, `kill`, a closed tmux pane).
+///
+/// That quit can't happen while gping is stuck writing to a terminal that has stopped
+/// reading (a stalled ssh session), so a second signal, or a few seconds' wait, ends it
+/// regardless: out of raw mode, which takes no output, and by the signal it was sent. (As
+/// far as the system lets it: macOS holds back even SIGKILL until the terminal reads again.)
 #[cfg(unix)]
 pub fn start_signals(tx: Sender<Event>) -> Result<()> {
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    const GIVE_UP_AFTER: Duration = Duration::from_secs(5);
     let mut signals = signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP])?;
     thread::spawn(move || {
-        if let Some(signal) = signals.forever().next() {
-            let _ = tx.send(Event::Signal(signal));
-        }
+        let Some(first) = signals.forever().next() else {
+            return;
+        };
+        let _ = tx.send(Event::Signal(first));
+        let deadline = Instant::now() + GIVE_UP_AFTER;
+        let signal = loop {
+            if let Some(again) = signals.pending().next() {
+                break again;
+            }
+            if Instant::now() >= deadline {
+                break first;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        let _ = tui::crossterm::terminal::disable_raw_mode();
+        let _ = signal_hook::low_level::emulate_default_handler(signal);
+        std::process::exit(128 + signal);
     });
     Ok(())
 }

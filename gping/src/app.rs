@@ -88,6 +88,8 @@ pub struct Host {
 /// Running totals for the whole session.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Session {
+    /// When the session started (or was last reset), in seconds since start.
+    pub since: f64,
     pub sent: u64,
     pub lost: u64,
     /// Latency totals over the replies, in microseconds.
@@ -102,8 +104,9 @@ pub struct Session {
 }
 
 impl Session {
-    fn new() -> Session {
+    fn new(since: f64) -> Session {
         Session {
+            since,
             sent: 0,
             lost: 0,
             min: f64::INFINITY,
@@ -145,7 +148,7 @@ impl Host {
             tint,
             chosen_color: false,
             samples: Vec::with_capacity(512),
-            session: Session::new(),
+            session: Session::new(0.0),
             history: History::new(0.0),
             state: HostState::Running,
             recent: VecDeque::new(),
@@ -189,9 +192,12 @@ impl Host {
         self.history.record(at, value);
     }
 
-    /// Forgets the session so far: totals, history and baseline. The chart is untouched.
+    /// Forgets the session so far: totals, history and baseline. The chart is untouched, and
+    /// so is when the host last replied, which is about the host, not the totals.
     pub fn reset(&mut self, now: f64) {
-        self.session = Session::new();
+        let last_reply = self.session.last_reply;
+        self.session = Session::new(now);
+        self.session.last_reply = last_reply;
         self.history = History::new(now);
         self.recent.clear();
     }
@@ -225,9 +231,18 @@ impl Host {
         Some(percentile(&mut values, 0.5))
     }
 
-    /// How long without a reply counts as down.
+    /// How long without a reply counts as down. A reply can only come every reply time plus
+    /// the interval (a slow `--cmd` takes seconds to run), so that is allowed for, going by
+    /// the newest reply until there are enough for a baseline.
     fn down_after(&self, interval: f64) -> f64 {
-        let typical = self.baseline().unwrap_or(0.0) / 1_000_000.0;
+        let newest = || {
+            self.samples
+                .iter()
+                .rev()
+                .map(|&(_, v)| v)
+                .find(|v| !v.is_nan())
+        };
+        let typical = self.baseline().or_else(newest).unwrap_or(0.0) / 1_000_000.0;
         3.0f64.max(5.0 * interval).max(3.0 * typical + interval)
     }
 
@@ -746,5 +761,40 @@ mod tests {
         assert!(host.baseline().is_none());
         assert!(host.history.is_empty());
         assert_eq!(host.samples.len(), 20, "the chart keeps its samples");
+    }
+
+    // Resetting the totals changes nothing about the host itself: one that was replying
+    // isn't "waiting" again, and one that has been down for 30 seconds hasn't been down
+    // since gping started.
+    #[test]
+    fn resetting_keeps_when_the_host_last_replied() {
+        let interval = 0.2;
+        let mut replies: Vec<(f64, Option<u64>)> =
+            (0..=500).map(|i| (i as f64 * 0.2, Some(10))).collect();
+        let mut healthy = host_with(&replies);
+        healthy.reset(100.0);
+        assert_eq!(healthy.status(100.1, interval), Status::Steady);
+        // The first thing to arrive after the reset is a loss, dated back to when it was sent.
+        healthy.record(98.5, None);
+        assert_eq!(healthy.status(100.6, interval), Status::Lossy);
+
+        replies.extend((1..=150).map(|i| (100.0 + i as f64 * 0.2, None)));
+        let mut down = host_with(&replies);
+        down.reset(130.0);
+        assert!(
+            matches!(down.readout(130.0, interval), Readout::NoReply(s) if (s - 30.0).abs() < 1e-6)
+        );
+    }
+
+    // A --cmd that takes four seconds, run every half second, can only reply every 4.5s.
+    #[test]
+    fn a_slow_command_is_not_down_between_runs() {
+        let runs: Vec<(f64, Option<u64>)> = (0..5)
+            .map(|i| (4.5 * i as f64 + 4.0, Some(4_000)))
+            .collect();
+        let host = host_with(&runs);
+        let last = 22.0;
+        assert_eq!(host.status(last + 4.4, 0.5), Status::Steady);
+        assert_eq!(host.status(last + 30.0, 0.5), Status::Down);
     }
 }

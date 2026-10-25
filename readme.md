@@ -116,7 +116,8 @@ shorthands like `aws:eu-west-1`, `aws:ca-central-1` or `gcp:me-central2` to ping
 ## Colour
 
 gping draws in 24-bit colour on a background of its own, so it looks the same on any theme. It works out what your
-terminal supports from `COLORTERM` and `TERM`, and falls back to 256 or 16 colours. You can override that:
+terminal supports from `COLORTERM` and `TERM`, and falls back to 256 or 16 colours (with 16, lost pings are marked by
+their ✕ alone, without the red curtain). You can override that:
 
 * `GPING_COLOR=truecolor`, `256`, `16` or `none` picks the colour depth.
 * `NO_COLOR=1` turns colour off; shapes, gaps and words still carry every meaning.

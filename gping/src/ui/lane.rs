@@ -6,7 +6,7 @@ use super::layout::Lane;
 use super::{HostView, Scene};
 use crate::app::{grade, App};
 use crate::format;
-use crate::plot::{Drawn, Glow, Marker, Plot, Series};
+use crate::plot::{cell_row, Drawn, Glow, Marker, Plot, Series};
 use crate::theme::mix;
 use tui::buffer::Buffer;
 use tui::style::{Color, Modifier, Style};
@@ -24,7 +24,17 @@ pub fn draw(
 ) -> Drawn {
     let t = scene.theme;
     let host = &scene.app.hosts[lane.host];
-    let (ticks, step) = App::y_ticks(bounds, lane.plot.height);
+    // A scale with nothing on it (a host that is down, or hasn't answered yet) would only
+    // suggest latencies that were never seen.
+    let replied = host
+        .window(scene.x_bounds)
+        .iter()
+        .any(|(_, value)| !value.is_nan());
+    let (ticks, step) = if replied {
+        App::y_ticks(bounds, lane.plot.height)
+    } else {
+        (Vec::new(), 1.0)
+    };
 
     // Heat: the line warms through amber, orange and red where it's slower than the host
     // usually is. Not for a host whose colour was chosen with --color: that choice wins.
@@ -56,11 +66,7 @@ pub fn draw(
         }],
         x_bounds: scene.x_bounds,
         y_bounds: bounds,
-        marker: if scene.options.simple_graphics {
-            Marker::Dot
-        } else {
-            Marker::Braille
-        },
+        marker: marker(scene),
         grid: ticks.clone(),
         grid_color: t.grid,
         base: t.base_rgb,
@@ -74,6 +80,14 @@ pub fn draw(
         histogram(buf, rect, scene, lane.host, bounds);
     }
     drawn
+}
+
+fn marker(scene: &Scene) -> Marker {
+    if scene.options.simple_graphics {
+        Marker::Dot
+    } else {
+        Marker::Braille
+    }
 }
 
 /// Tick labels down the left, on the rows their values sit on.
@@ -110,15 +124,14 @@ fn gutter(
     if plot_rows == 0 || hi <= lo {
         return;
     }
-    let dots = plot_rows as f64 * 4.0 - 1.0;
     let mut last_row = None;
     for &tick in ticks.iter().rev() {
-        let row = (((hi - tick) / (hi - lo) * dots).round() / 4.0).floor() as u16;
-        if row >= plot_rows || last_row == Some(row) {
+        let row = cell_row(tick, [lo, hi], plot_rows, marker(scene));
+        if !(0..plot_rows as i64).contains(&row) || last_row == Some(row) {
             continue;
         }
         last_row = Some(row);
-        let y = rect.y + row;
+        let y = rect.y + row as u16;
         let label = format::tick(tick, step, hi);
         let x = axis_x
             .saturating_sub(label.chars().count() as u16)
@@ -221,13 +234,12 @@ fn histogram(
         return;
     }
     let mut counts = vec![0u32; rows];
-    let dots = rows as f64 * 4.0 - 1.0;
     for &(_, value) in host.window(scene.x_bounds) {
         if value.is_nan() || value < lo || value > hi {
             continue;
         }
-        let row = (((hi - value) / (hi - lo) * dots).round() / 4.0).floor() as usize;
-        counts[row.min(rows - 1)] += 1;
+        let row = cell_row(value, [lo, hi], rect.height, marker(scene));
+        counts[(row.max(0) as usize).min(rows - 1)] += 1;
     }
     let most = counts.iter().copied().max().unwrap_or(0);
     if most == 0 {

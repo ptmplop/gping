@@ -12,9 +12,10 @@ use crate::theme;
 use crate::ui::{KeyOutcome, Ui, UiOptions};
 use anyhow::{anyhow, bail, Result};
 use pinger::{PingMode, PingOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Stdout, Write};
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tui::backend::CrosstermBackend;
@@ -106,13 +107,17 @@ pub fn run(args: Args) -> Result<Outcome> {
     let mut app = App::new(hosts, args.buffer as f64, 0.0, yrange);
     let mut ui = Ui::new(UiOptions::from_args(&args, interval, depth));
 
-    let guard = TerminalGuard::enter(args.clear)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(BufWriter::with_capacity(
-        1 << 20,
-        io::stdout(),
-    )))?;
-    // terminal.clear() reads the cursor position, which fails in some CI environments.
-    execute!(terminal.backend_mut(), Clear(ClearType::All))?;
+    let (guard, mut terminal) = match set_up_terminal(args.clear) {
+        Ok(terminal) => terminal,
+        // A signal can interrupt the setup (`timeout` stopping gping before it's had the
+        // terminal): then it's the signal that counts, not the call it cut short.
+        Err(err) => {
+            return match pending_signal(&rx) {
+                Some(signal) => Ok(Outcome::Signalled(signal)),
+                None => Err(err),
+            }
+        }
+    };
 
     let stop_input = Arc::new(AtomicBool::new(false));
     probes::start_input(tx.clone(), Arc::clone(&stop_input));
@@ -179,7 +184,7 @@ pub fn run(args: Args) -> Result<Outcome> {
     // One last frame, re-typeset for the scrollback, unless we're about to vanish anyway.
     let now = clock.elapsed().as_secs_f64();
     let last_row = draw(&mut terminal, &mut ui, &mut app, now, true, depth).unwrap_or(0);
-    drop(terminal);
+    let _ = terminal.backend_mut().flush();
     guard.leave(last_row, args.vertical_margin == 0);
 
     Ok(match outcome {
@@ -192,6 +197,33 @@ pub fn run(args: Args) -> Result<Outcome> {
 enum Probe {
     Ping(PingOptions),
     Command((String, Vec<String>)),
+}
+
+type Screen = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
+
+/// Takes over the terminal. The `Terminal` is never dropped: its `Drop` shows the cursor
+/// (the guard does that), and if the terminal has gone (a closed window) it reports the
+/// failure with `eprintln!`, which panics with nowhere to print to.
+fn set_up_terminal(alternate_screen: bool) -> Result<(TerminalGuard, ManuallyDrop<Screen>)> {
+    let guard = TerminalGuard::enter(alternate_screen)?;
+    let mut terminal = ManuallyDrop::new(Terminal::new(CrosstermBackend::new(
+        BufWriter::with_capacity(1 << 20, io::stdout()),
+    ))?);
+    // terminal.clear() reads the cursor position, which fails in some CI environments.
+    execute!(terminal.backend_mut(), Clear(ClearType::All))?;
+    Ok((guard, terminal))
+}
+
+/// A stop signal that has just arrived, if there is one, allowing the thread that passes
+/// it on a moment to do so.
+fn pending_signal(rx: &Receiver<Event>) -> Option<i32> {
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while let Ok(event) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        if let Event::Signal(signal) = event {
+            return Some(signal);
+        }
+    }
+    None
 }
 
 fn ping_options(args: &Args, target: &hosts::Target, interval: Duration) -> PingOptions {
