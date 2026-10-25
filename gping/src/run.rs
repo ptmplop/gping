@@ -89,6 +89,9 @@ pub fn run(args: Args) -> Result<Outcome> {
         hosts.push(host);
     }
 
+    // Declared before the channel, so that it is dropped after it: by then no thread can
+    // report a result, and none starts another command.
+    let _stopper = probes::Stopper;
     let (tx, rx) = mpsc::channel();
     // Before raw mode, so that a signal arriving during setup is handled the same way.
     probes::start_signals(tx.clone())?;

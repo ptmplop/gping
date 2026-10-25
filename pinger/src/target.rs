@@ -37,6 +37,18 @@ impl Target {
         )
     }
 
+    /// An address, which ping can start pinging without looking anything up. That
+    /// includes a scoped IPv6 address ("fe80::1%en0"), which `IpAddr` doesn't parse.
+    #[cfg(unix)]
+    pub(crate) fn is_address(&self) -> bool {
+        match self {
+            Target::IP(_) => true,
+            Target::Hostname { domain, .. } => domain
+                .split_once('%')
+                .is_some_and(|(address, _)| address.parse::<Ipv6Addr>().is_ok()),
+        }
+    }
+
     pub fn new_any(value: impl ToString) -> Self {
         let value = value.to_string();
         if let Ok(ip) = value.parse::<IpAddr>() {
@@ -77,5 +89,19 @@ impl Display for Target {
             Target::IP(v) => Display::fmt(&v, f),
             Target::Hostname { domain, .. } => Display::fmt(&domain, f),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn addresses_need_no_lookup() {
+        assert!(Target::new_any("192.0.2.1").is_address());
+        assert!(Target::new_ipv6("2001:db8::1").is_address());
+        assert!(Target::new_ipv6("fe80::1%en0").is_address());
+        assert!(!Target::new_any("example.com").is_address());
+        assert!(!Target::new_any("example.com%en0").is_address());
     }
 }

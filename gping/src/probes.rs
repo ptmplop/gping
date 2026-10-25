@@ -1,16 +1,17 @@
 //! The background threads that ping hosts or time commands, feeding results to the UI.
 //!
 //! Nothing here is ever joined: quitting must not wait for a ping that is due in five
-//! seconds or a command that takes a minute. The threads notice that the UI has gone the
-//! next time they try to report to it, and stop.
+//! seconds or a command that takes a minute. Instead [`Stopper`] ends the processes they
+//! run, which gping would otherwise leave behind, and the threads die with gping.
 
 use crate::app::HostState;
 use anyhow::{bail, Result};
 use pinger::{ping, PingOptions, PingResult};
-use std::process::{Command, Stdio};
+use std::io;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 use tui::crossterm::event::Event as TerminalEvent;
@@ -128,6 +129,61 @@ pub fn parse_command(command: &str) -> Result<(String, Vec<String>)> {
     }
 }
 
+/// Set once gping has started stopping everything, so that no new command starts.
+static STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// The commands running right now, by process ID.
+static COMMANDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Stops every ping and command still running when it is dropped, however gping exits.
+/// A ping to a host that never answers may print nothing for as long as it runs, so it
+/// would never notice that gping has gone; and a command can take as long as it likes.
+pub struct Stopper;
+
+impl Drop for Stopper {
+    fn drop(&mut self) {
+        STOPPING.store(true, Ordering::Release);
+        pinger::stop_all();
+        let running = std::mem::take(&mut *COMMANDS.lock().unwrap_or_else(PoisonError::into_inner));
+        for id in running {
+            stop(id);
+        }
+    }
+}
+
+/// A command leaves the list as soon as it has been waited for, and process IDs are
+/// handed out in turn rather than reused at once, so `id` is still the command's.
+#[cfg(unix)]
+fn stop(id: u32) {
+    // SAFETY: kill(2) takes plain integers and touches no memory of ours.
+    unsafe {
+        libc::kill(id as libc::pid_t, libc::SIGTERM);
+    }
+}
+
+/// Windows has no signals to send; a command running as gping quits finishes on its own.
+#[cfg(not(unix))]
+fn stop(_id: u32) {}
+
+/// Waits for a command to finish, listed among those to stop if gping quits meanwhile.
+fn wait(mut child: Child) -> io::Result<ExitStatus> {
+    let id = child.id();
+    COMMANDS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(id);
+    // If gping started stopping everything just before it was listed, it was missed.
+    if STOPPING.load(Ordering::Acquire) {
+        let _ = child.kill();
+    }
+    let status = child.wait();
+    COMMANDS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|running| *running != id);
+    status
+}
+
 /// Runs a command over and over, timing each run. A run that exits unsuccessfully counts
 /// as lost. The command gets no stdin: it would otherwise read the keys meant for gping.
 pub fn start_command(
@@ -137,6 +193,9 @@ pub fn start_command(
     tx: Sender<Event>,
 ) {
     thread::spawn(move || loop {
+        if STOPPING.load(Ordering::Acquire) {
+            return;
+        }
         let started = Instant::now();
         let child = Command::new(&program)
             .args(&args)
@@ -144,7 +203,7 @@ pub fn start_command(
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn();
-        let event = match child.and_then(|mut child| child.wait()) {
+        let event = match child.and_then(wait) {
             Ok(status) => Event::Probe(
                 host,
                 status.success().then(|| started.elapsed()),

@@ -21,7 +21,7 @@ use std::fmt::{Debug, Formatter};
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 use std::{fmt, io, thread};
 use target::Target;
@@ -159,6 +159,52 @@ pub(crate) fn extract_regex(regex: &Regex, line: String) -> Option<PingResult> {
     Some(PingResult::Pong(duration, line))
 }
 
+/// When a ping sends its packets: the first, numbered `first`, as soon as it starts, and
+/// then one every `interval`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Schedule {
+    pub first: u16,
+    pub interval: Duration,
+}
+
+/// The schedule of a BSD-style ping (macOS, the BSDs, BusyBox), which numbers its packets
+/// from 0. Only for an address, which ping starts pinging straight away: a hostname has
+/// to be looked up first, which takes as long as it takes. And only when we chose all of
+/// ping's arguments, since the user's could change it (`-i`, `-c`, `-q`, `-f`).
+#[cfg(unix)]
+pub(crate) fn bsd_style_schedule(options: &PingOptions) -> Option<Schedule> {
+    let own_arguments = options.raw_arguments.as_ref().is_none_or(|a| a.is_empty());
+    (own_arguments && options.target.is_address()).then_some(Schedule {
+        first: 0,
+        interval: options.interval,
+    })
+}
+
+/// What the thread reading ping's output passes on to the one keeping track of losses.
+enum Output {
+    Result(PingResult),
+    /// ping's closing statistics: how many packets it sent, and how many were answered.
+    Summary(u64, u64),
+}
+
+/// The ping processes that have been started, so that [`stop_all`] can end them.
+static RUNNING: Mutex<Vec<Weak<Mutex<Child>>>> = Mutex::new(Vec::new());
+
+/// Ends every ping process started by this crate that is still running. Call it before
+/// the program exits: a ping to a host that never answers may print nothing for as long
+/// as it runs, so it would never find out that nobody is reading its output any more,
+/// and would go on pinging after the program has gone.
+pub fn stop_all() {
+    let running = std::mem::take(&mut *RUNNING.lock().unwrap_or_else(PoisonError::into_inner));
+    for child in running.iter().filter_map(Weak::upgrade) {
+        // Only held while waiting for a ping that has closed its output, so is exiting.
+        if let Ok(mut child) = child.try_lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 pub trait Pinger: Send + Sync {
     fn from_options(options: PingOptions) -> std::result::Result<Self, PingCreationError>
     where
@@ -168,13 +214,28 @@ pub trait Pinger: Send + Sync {
 
     fn ping_args(&self) -> (&str, Vec<String>);
 
+    /// When ping sends its packets, if that is known in advance. A packet that ping never
+    /// says anything about then counts as lost once it is overdue, instead of only once a
+    /// later reply overtakes it (so never, for a host that doesn't answer at all). `None`
+    /// suits a ping that reports every unanswered packet itself.
+    fn schedule(&self) -> Option<Schedule> {
+        None
+    }
+
     fn start(&self) -> Result<mpsc::Receiver<PingResult>, PingCreationError> {
         let (tx, rx) = mpsc::channel();
         let (cmd, args) = self.ping_args();
 
         let mut child = run_ping(cmd, args)?;
+        let spawned = Instant::now();
         let stdout = child.stdout.take().expect("child did not have a stdout");
         let stderr = child.stderr.take().expect("child did not have a stderr");
+        let child = Arc::new(Mutex::new(child));
+        {
+            let mut running = RUNNING.lock().unwrap_or_else(PoisonError::into_inner);
+            running.retain(|child| child.strong_count() > 0);
+            running.push(Arc::downgrade(&child));
+        }
 
         // ping writes to stderr for every packet it fails to send ("ping: sendto: No
         // route to host" on macOS and the BSDs, for as long as an outage lasts). The pipe
@@ -187,27 +248,45 @@ pub trait Pinger: Send + Sync {
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
-                if let Some(result) = parse_fn(line) {
-                    if line_tx.send(result).is_err() {
+                let output = match loss::summary_of(&line) {
+                    Some((transmitted, received)) => Some(Output::Summary(transmitted, received)),
+                    None => parse_fn(line).map(Output::Result),
+                };
+                if let Some(output) = output {
+                    if line_tx.send(output).is_err() {
                         break;
                     }
                 }
             }
         });
 
+        let schedule = self.schedule();
         thread::spawn(move || {
             // A timeout reported by ping is only provisional: see `loss`.
-            let mut tracker = loss::LossTracker::default();
+            let mut tracker = loss::LossTracker::new(schedule);
+            tracker.started(spawned);
             loop {
-                let received = match tracker.next_deadline() {
+                let deadline = tracker.next_deadline();
+                let received = match deadline {
                     Some(deadline) => {
                         line_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
                     }
                     None => line_rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
                 };
                 let now = Instant::now();
+                if let Some(late) =
+                    deadline.and_then(|deadline| now.checked_duration_since(deadline))
+                {
+                    if late > loss::STALL {
+                        tracker.stalled(late);
+                    }
+                }
                 let mut results = match received {
-                    Ok(result) => tracker.on_result(result, now),
+                    Ok(Output::Result(result)) => tracker.on_result(result, now),
+                    Ok(Output::Summary(transmitted, received)) => {
+                        tracker.summary(transmitted, received);
+                        vec![]
+                    }
                     Err(RecvTimeoutError::Timeout) => vec![],
                     // stdout is closed: ping has exited, or is about to.
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -216,6 +295,7 @@ pub trait Pinger: Send + Sync {
                 for result in results {
                     if tx.send(result).is_err() {
                         // Nobody is listening any more, so stop pinging.
+                        let mut child = child.lock().unwrap_or_else(PoisonError::into_inner);
                         let _ = child.kill();
                         let _ = child.wait();
                         return;
@@ -225,7 +305,11 @@ pub trait Pinger: Send + Sync {
             for result in tracker.finish() {
                 let _ = tx.send(result);
             }
-            let status = child.wait().expect("Child wasn't started?");
+            let status = child
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .wait()
+                .expect("Child wasn't started?");
             let stderr = stderr_reader.join().unwrap_or_default();
             let _ = tx.send(PingResult::PingExited(status, stderr));
         });
@@ -327,9 +411,9 @@ pub fn timeout_delay(options: &PingOptions) -> Duration {
         // ping reports the timeout, which is then held back for `LATE_REPLY_GRACE`.
         #[cfg(unix)]
         PingMode::ICMP => loss::LATE_REPLY_GRACE,
-        // IcmpSendEcho gives up after winping's default timeout.
+        // Every failure is reported as late as a timed out IcmpSendEcho is.
         #[cfg(windows)]
-        PingMode::ICMP => Duration::from_secs(2),
+        PingMode::ICMP => windows::TIMEOUT,
     }
 }
 

@@ -1,4 +1,7 @@
-use crate::{extract_regex, interval_arg, PingCreationError, PingOptions, PingResult, Pinger};
+use crate::{
+    bsd_style_schedule, extract_regex, interval_arg, PingCreationError, PingOptions, PingResult,
+    Pinger, Schedule,
+};
 use lazy_regex::*;
 use std::net::IpAddr;
 
@@ -42,6 +45,11 @@ impl Pinger for BSDPinger {
 
     fn parse_fn(&self) -> fn(String) -> Option<PingResult> {
         parse_bsd
+    }
+
+    // It says nothing about a lost packet.
+    fn schedule(&self) -> Option<Schedule> {
+        bsd_style_schedule(&self.options)
     }
 
     fn ping_args(&self) -> (&str, Vec<String>) {

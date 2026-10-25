@@ -5,8 +5,11 @@ use lazy_regex::*;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use winping::{Buffer, Pinger as WinPinger};
+
+/// How long IcmpSendEcho waits for a reply.
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(2);
 
 pub static RE: Lazy<Regex> = lazy_regex!(r"(?ix-u)time=(?P<ms>\d+)(?:\.(?P<ns>\d+))?");
 
@@ -64,27 +67,26 @@ impl Pinger for WindowsPinger {
         let (tx, rx) = mpsc::channel();
 
         thread::spawn(move || {
-            let pinger = WinPinger::new().expect("Failed to create a WinPinger instance");
+            let mut pinger = WinPinger::new().expect("Failed to create a WinPinger instance");
+            pinger.set_timeout(TIMEOUT.as_millis() as u32);
             let mut buffer = Buffer::new();
             loop {
-                match pinger.send(parsed_ip, &mut buffer) {
-                    Ok(rtt) => {
-                        if tx
-                            .send(PingResult::Pong(
-                                Duration::from_millis(rtt as u64),
-                                "".to_string(),
-                            ))
-                            .is_err()
-                        {
-                            break;
+                let sent = Instant::now();
+                let result = match pinger.send(parsed_ip, &mut buffer) {
+                    Ok(rtt) => PingResult::Pong(Duration::from_millis(rtt as u64), "".to_string()),
+                    Err(error) => {
+                        // Every failure counts as a timeout. A real one is only known once
+                        // IcmpSendEcho has waited for the reply, but others (no route, the
+                        // network adapter down) come back at once: hold those back as long,
+                        // so that every loss arrives as late as `timeout_delay` says.
+                        if !matches!(error, winping::Error::Timeout) {
+                            thread::sleep(TIMEOUT.saturating_sub(sent.elapsed()));
                         }
+                        PingResult::Timeout("".to_string())
                     }
-                    Err(_) => {
-                        // Fuck it. All errors are timeouts. Why not.
-                        if tx.send(PingResult::Timeout("".to_string())).is_err() {
-                            break;
-                        }
-                    }
+                };
+                if tx.send(result).is_err() {
+                    break;
                 }
                 thread::sleep(interval);
             }

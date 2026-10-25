@@ -1,5 +1,7 @@
 use crate::bsd::parse_bsd;
-use crate::{interval_arg, PingCreationError, PingOptions, PingResult, Pinger};
+use crate::{
+    bsd_style_schedule, interval_arg, PingCreationError, PingOptions, PingResult, Pinger, Schedule,
+};
 use lazy_regex::*;
 
 pub static RE: Lazy<Regex> = lazy_regex!(r"time=(?:(?P<ms>[0-9]+).(?P<ns>[0-9]+)\s+ms)");
@@ -18,6 +20,11 @@ impl Pinger for MacOSPinger {
 
     fn parse_fn(&self) -> fn(String) -> Option<PingResult> {
         parse_bsd
+    }
+
+    // ping6 says nothing about a lost packet, and ping only sometimes does.
+    fn schedule(&self) -> Option<Schedule> {
+        bsd_style_schedule(&self.options)
     }
 
     fn ping_args(&self) -> (&str, Vec<String>) {

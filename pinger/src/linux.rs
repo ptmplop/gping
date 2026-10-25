@@ -1,5 +1,6 @@
 use crate::{
-    extract_regex, interval_arg, run_ping, PingCreationError, PingOptions, PingResult, Pinger,
+    bsd_style_schedule, extract_regex, interval_arg, run_ping, PingCreationError, PingOptions,
+    PingResult, Pinger, Schedule,
 };
 use lazy_regex::*;
 
@@ -60,6 +61,14 @@ impl Pinger for LinuxPinger {
                 return Some(PingResult::Timeout(line));
             }
             None
+        }
+    }
+
+    // BusyBox says nothing about a lost packet; iputils reports each one (`-O`).
+    fn schedule(&self) -> Option<Schedule> {
+        match self {
+            LinuxPinger::BusyBox(options) => bsd_style_schedule(options),
+            LinuxPinger::IPTools(_) => None,
         }
     }
 

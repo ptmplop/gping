@@ -27,3 +27,5 @@ signal-hook = "0.3.18"
 # /dev/tty, which its default kqueue-based reader can't watch on macOS: every key, Ctrl-C
 # included, was ignored. `use-dev-tty` reads it with poll(2) instead.
 crossterm = { version = "0.29.0", features = ["use-dev-tty"] }
+# To stop a --cmd command that is still running when gping exits.
+libc = "0.2.189"
