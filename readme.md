@@ -2,6 +2,9 @@
 
 Ping, but with a graph.
 
+This is a fork of [gping](https://github.com/orf/gping), created by [Tom Forbes](https://github.com/orf), with a
+redesigned screen and reworked loss tracking.
+
 ![](./images/readme-example.gif)
 
 Comes with the following super-powers:
@@ -19,11 +22,12 @@ Table of Contents
 
    * [Install :cd:](#install-cd)
    * [Usage :saxophone:](#usage-saxophone)
+   * [Credits :heart:](#credits-heart)
 
 # Install :cd:
 
-This is a fork of [gping](https://github.com/orf/gping). The packages in Homebrew, the Linux distributions, Scoop,
-Chocolatey, WinGet, crates.io and Docker are all the original, without the changes here. To get this version:
+The packages in Homebrew, the Linux distributions, Scoop, Chocolatey, WinGet, crates.io and Docker are all the
+original gping, without the changes here. To get this version:
 
 * Download a build from the [releases page](../../releases)
 * Or build it from a checkout of this repository (this requires `rustc` version 1.88.0 or greater):
@@ -135,3 +139,9 @@ Options:
   -V, --version
           Print version
 ```
+
+# Credits :heart:
+
+gping was created by [Tom Forbes](https://github.com/orf) and is built by him and
+[its contributors](https://github.com/orf/gping/graphs/contributors). This fork builds on their work, and like the
+original it is released under the [MIT licence](LICENSE).
